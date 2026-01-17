@@ -1,5 +1,6 @@
-12.7test31
+12.7test32
 
+* bug fix: QVM crash loading demo
 * fallback to dlc_gibs for EV_JUICED
 * fix EV_JUICED and EV_LIGHTNINGBOLT index (yumirak)
 * remove cl_aviPrimeAudioRate can cause audio sync issues
