@@ -123,6 +123,8 @@ win64:
             Built with Visual Studio 2022 with PlatformToolSet v141_xp.
             x64 built with TargetName SDL264 / SDL264main to use SDL264.dll.
 
+ 2026-02-28 using SDL from ioquake3 without architecture renaming
+
 macosx:
 
    how to combine libraries from different architectures:

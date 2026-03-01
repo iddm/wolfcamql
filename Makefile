@@ -248,10 +248,6 @@ ifndef USE_RENDERER_DLOPEN
 USE_RENDERER_DLOPEN=1
 endif
 
-ifndef USE_ARCHLESS_FILENAMES
-USE_ARCHLESS_FILENAMES=0
-endif
-
 ifndef USE_YACC
 USE_YACC=0
 endif
@@ -892,12 +888,12 @@ ifdef MINGW
       SDLDLL=SDL2.dll
       CLIENT_EXTRA_FILES += $(LIBSDIR)/win32/SDL2.dll
     else
-      CLIENT_LIBS += $(LIBSDIR)/win64/libSDL264main.a \
-                      $(LIBSDIR)/win64/libSDL264.dll.a
-      RENDERER_LIBS += $(LIBSDIR)/win64/libSDL264main.a \
-                      $(LIBSDIR)/win64/libSDL264.dll.a
-      SDLDLL=SDL264.dll
-      CLIENT_EXTRA_FILES += $(LIBSDIR)/win64/SDL264.dll
+      CLIENT_LIBS += $(LIBSDIR)/win64/libSDL2main.a \
+                      $(LIBSDIR)/win64/libSDL2.dll.a
+      RENDERER_LIBS += $(LIBSDIR)/win64/libSDL2main.a \
+                      $(LIBSDIR)/win64/libSDL2.dll.a
+      SDLDLL=SDL2.dll
+      CLIENT_EXTRA_FILES += $(LIBSDIR)/win64/SDL2.dll
     endif
   else
     CLIENT_CFLAGS += $(SDL_CFLAGS)
@@ -1243,21 +1239,11 @@ endif
 TARGETS =
 
 ifndef FULLBINEXT
-  ifeq ($(USE_ARCHLESS_FILENAMES),1)
-    FULLBINEXT=$(BINEXT)
-  else
-    FULLBINEXT=.$(ARCH)$(BINEXT)
-  endif
+  FULLBINEXT=$(BINEXT)
 endif
 
 ifndef SHLIBNAME
-  ifeq ($(USE_ARCHLESS_FILENAMES),1)
-    SHLIBNAME=.$(SHLIBEXT)
-    RSHLIBNAME=$(SHLIBNAME)
-  else
-    SHLIBNAME=$(ARCH).$(SHLIBEXT)
-    RSHLIBNAME=_$(SHLIBNAME)
-  endif
+  SHLIBNAME=.$(SHLIBEXT)
 endif
 
 ifneq ($(BUILD_SERVER),0)
@@ -1269,10 +1255,10 @@ ifneq ($(BUILD_CLIENT),0)
     TARGETS += $(B)/$(CLIENTBIN)$(FULLBINEXT)
 
     ifneq ($(BUILD_RENDERER_OPENGL1),0)
-      TARGETS += $(B)/renderer_opengl1$(RSHLIBNAME)
+      TARGETS += $(B)/renderer_opengl1$(SHLIBNAME)
     endif
     ifneq ($(BUILD_RENDERER_OPENGL2),0)
-      TARGETS += $(B)/renderer_opengl2$(RSHLIBNAME)
+      TARGETS += $(B)/renderer_opengl2$(SHLIBNAME)
     endif
   else
     ifneq ($(BUILD_RENDERER_OPENGL1),0)
@@ -1506,10 +1492,6 @@ endif
 
 ifeq ($(BUILD_STANDALONE),1)
   BASE_CFLAGS += -DSTANDALONE
-endif
-
-ifeq ($(USE_ARCHLESS_FILENAMES),1)
-  BASE_CFLAGS += -DUSE_ARCHLESS_FILENAMES
 endif
 
 ifeq ($(GENERATE_DEPENDENCIES),1)
@@ -2711,12 +2693,12 @@ $(B)/$(CLIENTBIN)$(FULLBINEXT): $(Q3OBJ) $(SPLINES) $(LIBSDLMAIN) $(EXTRACLIENTB
 		$(NOTSHLIBLDFLAGS) -o $@ $(Q3OBJ) $(SPLINES) \
 		$(LIBSDLMAIN) $(CLIENT_LIBS) $(LIBS)
 
-$(B)/renderer_opengl1$(RSHLIBNAME): $(Q3ROBJ) $(JPGOBJ)
+$(B)/renderer_opengl1$(SHLIBNAME): $(Q3ROBJ) $(JPGOBJ)
 	$(echo_cmd) "LD $@"
 	$(Q)$(CC) $(CFLAGS) $(SHLIBLDFLAGS) -o $@ $(Q3ROBJ) $(JPGOBJ) \
 		$(THREAD_LIBS) $(LIBSDLMAIN) $(RENDERER_LIBS) $(LIBS)
 
-$(B)/renderer_opengl2$(RSHLIBNAME): $(Q3R2OBJ) $(Q3R2STRINGOBJ) $(JPGOBJ)
+$(B)/renderer_opengl2$(SHLIBNAME): $(Q3R2OBJ) $(Q3R2STRINGOBJ) $(JPGOBJ)
 	$(echo_cmd) "LD $@"
 	$(Q)$(CC) $(CFLAGS) $(SHLIBLDFLAGS) -o $@ $(Q3R2OBJ) $(Q3R2STRINGOBJ) $(JPGOBJ) \
 		$(THREAD_LIBS) $(LIBSDLMAIN) $(RENDERER_LIBS) $(LIBS)
@@ -3567,10 +3549,10 @@ ifneq ($(BUILD_CLIENT),0)
   ifneq ($(USE_RENDERER_DLOPEN),0)
 	$(INSTALL) $(STRIP_FLAG) -m 0755 $(BR)/$(CLIENTBIN)$(FULLBINEXT) $(COPYBINDIR)/$(CLIENTBIN)$(FULLBINEXT)
     ifneq ($(BUILD_RENDERER_OPENGL1),0)
-	$(INSTALL) $(STRIP_FLAG) -m 0755 $(BR)/renderer_opengl1$(RSHLIBNAME) $(COPYBINDIR)/renderer_opengl1_$(SHLIBNAME)
+	$(INSTALL) $(STRIP_FLAG) -m 0755 $(BR)/renderer_opengl1$(SHLIBNAME) $(COPYBINDIR)/renderer_opengl1_$(SHLIBNAME)
     endif
     ifneq ($(BUILD_RENDERER_OPENGL2),0)
-	$(INSTALL) $(STRIP_FLAG) -m 0755 $(BR)/renderer_opengl2$(RSHLIBNAME) $(COPYBINDIR)/renderer_opengl2_$(SHLIBNAME)
+	$(INSTALL) $(STRIP_FLAG) -m 0755 $(BR)/renderer_opengl2$(SHLIBNAME) $(COPYBINDIR)/renderer_opengl2_$(SHLIBNAME)
     endif
   else
     ifneq ($(BUILD_RENDERER_OPENGL1),0)
@@ -3644,7 +3626,7 @@ toolsclean2:
 
 distclean: clean toolsclean
 	@rm -rf $(BUILD_DIR)
-	@rm -rf mac-binaries/cgamex86.dylib mac-binaries/qagamex86.dylib mac-binaries/uix86.dylib mac-binaries/wolfcamqlmac mac-binaries/renderer_opengl1_x86.dylib
+	@rm -rf mac-binaries/cgame.dylib mac-binaries/qagame.dylib mac-binaries/ui.dylib mac-binaries/wolfcamqlmac mac-binaries/renderer_opengl1.dylib
 
 installer: release
 ifdef MINGW

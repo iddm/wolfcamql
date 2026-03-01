@@ -1059,11 +1059,7 @@ void Sys_PlatformInit (qboolean useBacktrace, qboolean useConsoleOutput)
 	if (useBacktrace) {
 		DWORD lastError;
 
-#if defined(__x86_64__)
-		bt = LoadLibraryA("backtrace64.dll");
-#else
 		bt = LoadLibraryA("backtrace.dll");
-#endif
 		if (bt == NULL) {
 			lastError = GetLastError();
 			Com_Printf("ERROR loading backtrace library, error code: %ld\n", lastError);

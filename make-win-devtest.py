@@ -1,8 +1,18 @@
 #!/usr/bin/env python
-import os, shutil
+import os, shutil, sys
+
+build64 = True
+
+for arg in sys.argv[1:]:
+    if arg == "32":
+        build64 = False
 
 mainDir = os.getcwd()
-packageDir = "/share/wc/dev";
+
+if build64:
+    packageDir = "/share/wc/dev"
+else:
+    packageDir = "/share/wc/dev32"
 
 if not os.path.exists(packageDir):
     os.makedirs(packageDir)
@@ -38,51 +48,49 @@ for f in baseFiles:
     print("copying base file: " + f)
     shutil.copy(f, packageDir)
 
-# 64-bit
+if build64:  # 64-bit
+    libDir = os.path.join("code", "thirdparty", "libs", "win64")
+    buildDir = os.path.join("build", "release-mingw32-x86_64")
+    wolfcamDir = os.path.join(packageDir, "wolfcam-ql")
 
-libDir = os.path.join("code", "thirdparty", "libs", "win64")
-buildDir = os.path.join("build", "release-mingw32-x86_64")
-wolfcamDir = os.path.join(packageDir, "wolfcam-ql")
+    if os.path.exists(os.path.join(buildDir, "ioquake3.exe")):
+        print("copying 64-bit Windows binaries...")
+        try:
+            shutil.copy2(os.path.join(libDir, "SDL2.dll"), packageDir)
+            shutil.copy2(os.path.join(libDir, "backtrace.dll"), packageDir)
+            shutil.copy2(os.path.join(buildDir, "ioquake3.exe"), packageDir)
+            shutil.move(os.path.join(packageDir, "ioquake3.exe"), os.path.join(packageDir, "wolfcamql.exe"))
+            shutil.copy2(os.path.join(buildDir, "renderer_opengl1.dll"), packageDir)
+            shutil.copy2(os.path.join(buildDir, "renderer_opengl2.dll"), packageDir)
+            shutil.copy2(os.path.join(buildDir, "baseq3", "cgame.dll"), wolfcamDir)
+            shutil.copy2(os.path.join(buildDir, "baseq3", "qagame.dll"), wolfcamDir)
+            shutil.copy2(os.path.join(buildDir, "baseq3", "ui.dll"), wolfcamDir)
+        except IOError as err:
+            print(err)
+    else:
+        print("skipping 64-bit Windows binaries")
 
-if os.path.exists(os.path.join(buildDir, "ioquake3.x86_64.exe")):
-    print("copying 64-bit Windows binaries...")
-    try:
-        shutil.copy2(os.path.join(libDir, "SDL264.dll"), packageDir)
-        shutil.copy2(os.path.join(libDir, "backtrace64.dll"), packageDir)
-        shutil.copy2(os.path.join(buildDir, "ioquake3.x86_64.exe"), packageDir)
-        shutil.move(os.path.join(packageDir, "ioquake3.x86_64.exe"), os.path.join(packageDir, "wolfcamql.exe"))
-        shutil.copy2(os.path.join(buildDir, "renderer_opengl1_x86_64.dll"), packageDir)
-        shutil.copy2(os.path.join(buildDir, "renderer_opengl2_x86_64.dll"), packageDir)
-        shutil.copy2(os.path.join(buildDir, "baseq3", "cgamex86_64.dll"), wolfcamDir)
-        shutil.copy2(os.path.join(buildDir, "baseq3", "qagamex86_64.dll"), wolfcamDir)
-        shutil.copy2(os.path.join(buildDir, "baseq3", "uix86_64.dll"), wolfcamDir)
-    except IOError as err:
-        print(err)
-else:
-    print("skipping 64-bit Windows binaries")
+else:  # 32-bit
+    libDir = os.path.join("code", "thirdparty", "libs", "win32")
+    buildDir = os.path.join("build", "release-mingw32-x86")
+    wolfcamDir = os.path.join(packageDir, "wolfcam-ql")
 
-# 32-bit
-
-libDir = os.path.join("code", "thirdparty", "libs", "win32")
-buildDir = os.path.join("build", "release-mingw32-x86")
-wolfcamDir = os.path.join(packageDir, "wolfcam-ql")
-
-if os.path.exists(os.path.join(buildDir, "ioquake3.x86.exe")):
-    print("copying 32-bit Windows binaries...")
-    try:
-        shutil.copy2(os.path.join(libDir, "SDL2.dll"), packageDir)
-        shutil.copy2(os.path.join(libDir, "backtrace.dll"), packageDir)
-        shutil.copy2(os.path.join(buildDir, "ioquake3.x86.exe"), packageDir)
-        shutil.move(os.path.join(packageDir, "ioquake3.x86.exe"), os.path.join(packageDir, "wolfcamql32.exe"))
-        shutil.copy2(os.path.join(buildDir, "renderer_opengl1_x86.dll"), packageDir)
-        shutil.copy2(os.path.join(buildDir, "renderer_opengl2_x86.dll"), packageDir)
-        shutil.copy2(os.path.join(buildDir, "baseq3", "cgamex86.dll"), wolfcamDir)
-        shutil.copy2(os.path.join(buildDir, "baseq3", "qagamex86.dll"), wolfcamDir)
-        shutil.copy2(os.path.join(buildDir, "baseq3", "uix86.dll"), wolfcamDir)
-    except IOError as err:
-        print(err)
-else:
-    print("skipping 32-bit Windows binaries")
+    if os.path.exists(os.path.join(buildDir, "ioquake3.exe")):
+        print("copying 32-bit Windows binaries...")
+        try:
+            shutil.copy2(os.path.join(libDir, "SDL2.dll"), packageDir)
+            shutil.copy2(os.path.join(libDir, "backtrace.dll"), packageDir)
+            shutil.copy2(os.path.join(buildDir, "ioquake3.exe"), packageDir)
+            shutil.move(os.path.join(packageDir, "ioquake3.exe"), os.path.join(packageDir, "wolfcamql.exe"))
+            shutil.copy2(os.path.join(buildDir, "renderer_opengl1.dll"), packageDir)
+            shutil.copy2(os.path.join(buildDir, "renderer_opengl2.dll"), packageDir)
+            shutil.copy2(os.path.join(buildDir, "baseq3", "cgame.dll"), wolfcamDir)
+            shutil.copy2(os.path.join(buildDir, "baseq3", "qagame.dll"), wolfcamDir)
+            shutil.copy2(os.path.join(buildDir, "baseq3", "ui.dll"), wolfcamDir)
+        except IOError as err:
+            print(err)
+    else:
+        print("skipping 32-bit Windows binaries")
 
 print("copying misc files...")
 shutil.copy2(os.path.join("ui", "wcmenudef.h"), os.path.join(packageDir, "wolfcam-ql", "ui"))

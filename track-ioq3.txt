@@ -9049,3 +9049,6 @@ om/actions/runner-images/issues/12045
     Update sv_init.c to point to new directory server address
 
     directory.ioquake3.org has a new ip address as well
+
+2025-08-21-01
+    Remove architecture from binary filenames
