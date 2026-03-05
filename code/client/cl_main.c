@@ -40,7 +40,16 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
    typedef SOCKET clDemoSock_t;
 #  define CL_DEMO_INVALID_SOCK  INVALID_SOCKET
 #  define cl_demo_closesocket   closesocket
+#elif defined(__EMSCRIPTEN__)
+/* In the browser we use WebSocket for TCP streaming and emscripten_fetch
+ * for HTTP/HTTPS.  Raw POSIX sockets and pthreads are not available. */
+#  include <emscripten/websocket.h>
+#  include <emscripten/fetch.h>
+   typedef int clDemoSock_t;   /* unused; kept for uniform struct layout */
+#  define CL_DEMO_INVALID_SOCK  (-1)
+#  define cl_demo_closesocket(s) ((void)(s))
 #else
+/* POSIX */
 #  include <sys/socket.h>
 #  include <netdb.h>
 #  include <unistd.h>
@@ -60,7 +69,9 @@ typedef struct {
 	qboolean       active;
 	qboolean       done;
 	qboolean       error;
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+	int            wsSocket;   /* EMSCRIPTEN_WEBSOCKET_T (int handle) */
+#elif defined(_WIN32)
 	HANDLE         thread;
 #else
 	pthread_t      thread;
@@ -75,6 +86,9 @@ typedef struct {
 	qboolean  active;
 	qboolean  done;
 	qboolean  error;
+#ifdef __EMSCRIPTEN__
+	void     *emFetch;   /* emscripten_fetch_t* */
+#endif
 } clHttpDemoStream_t;
 
 static clHttpDemoStream_t httpDemoStream;
@@ -3239,21 +3253,31 @@ static void CL_CleanupDemoStreams(void)
 {
 	/* --- TCP --- */
 	if (tcpDemoStream.active) {
+#ifdef __EMSCRIPTEN__
+		if (tcpDemoStream.wsSocket > 0) {
+			emscripten_websocket_close(
+				(EMSCRIPTEN_WEBSOCKET_T)tcpDemoStream.wsSocket, 1000, "stopping");
+			emscripten_websocket_delete(
+				(EMSCRIPTEN_WEBSOCKET_T)tcpDemoStream.wsSocket);
+			tcpDemoStream.wsSocket = 0;
+		}
+#else  /* !__EMSCRIPTEN__ */
 		tcpDemoStream.stop = 1;
-		/* close the socket to unblock the recv() in the thread */
+		/* close the socket to unblock the recv() call in the thread */
 		if (tcpDemoStream.sock != CL_DEMO_INVALID_SOCK) {
 			cl_demo_closesocket(tcpDemoStream.sock);
 			tcpDemoStream.sock = CL_DEMO_INVALID_SOCK;
 		}
-#ifdef _WIN32
+#  ifdef _WIN32
 		if (tcpDemoStream.thread) {
 			WaitForSingleObject(tcpDemoStream.thread, 5000);
 			CloseHandle(tcpDemoStream.thread);
 			tcpDemoStream.thread = NULL;
 		}
-#else
+#  else
 		pthread_join(tcpDemoStream.thread, NULL);
-#endif
+#  endif
+#endif /* !__EMSCRIPTEN__ */
 		if (tcpDemoStream.writeFile) {
 			fclose(tcpDemoStream.writeFile);
 			tcpDemoStream.writeFile = NULL;
@@ -3268,7 +3292,12 @@ static void CL_CleanupDemoStreams(void)
 
 	/* --- HTTP --- */
 	if (httpDemoStream.active) {
-#ifdef USE_HTTP
+#ifdef __EMSCRIPTEN__
+		if (httpDemoStream.emFetch) {
+			emscripten_fetch_close((emscripten_fetch_t *)httpDemoStream.emFetch);
+			httpDemoStream.emFetch = NULL;
+		}
+#elif defined(USE_HTTP)
 		CL_HTTP_AbortDemoStream();
 #endif
 		if (httpDemoStream.writeFile) {
@@ -3283,7 +3312,98 @@ static void CL_CleanupDemoStreams(void)
 	}
 }
 
-/* Thread entry point: connect to host:port and pipe bytes to writeFile. */
+/* -----------------------------------------------------------------------
+ * Emscripten WebSocket callbacks (TCP streaming in the browser)
+ * ----------------------------------------------------------------------- */
+#ifdef __EMSCRIPTEN__
+
+static EM_BOOL CL_WsDemoOnOpen(int eventType,
+	const EmscriptenWebSocketOpenEvent *e, void *userData)
+{
+	(void)eventType; (void)e; (void)userData;
+	Com_Printf("^5TCP demo stream (WebSocket): connected\n");
+	return EM_TRUE;
+}
+
+static EM_BOOL CL_WsDemoOnMessage(int eventType,
+	const EmscriptenWebSocketMessageEvent *e, void *userData)
+{
+	(void)eventType; (void)userData;
+	if (e->numBytes > 0 && tcpDemoStream.writeFile) {
+		fwrite(e->data, 1, (size_t)e->numBytes, tcpDemoStream.writeFile);
+		fflush(tcpDemoStream.writeFile);
+	}
+	return EM_TRUE;
+}
+
+static EM_BOOL CL_WsDemoOnError(int eventType,
+	const EmscriptenWebSocketErrorEvent *e, void *userData)
+{
+	(void)eventType; (void)e; (void)userData;
+	Com_Printf("^1TCP demo stream (WebSocket): error\n");
+	if (tcpDemoStream.writeFile)
+		fflush(tcpDemoStream.writeFile);
+	tcpDemoStream.error = qtrue;
+	tcpDemoStream.done  = qtrue;
+	return EM_TRUE;
+}
+
+static EM_BOOL CL_WsDemoOnClose(int eventType,
+	const EmscriptenWebSocketCloseEvent *e, void *userData)
+{
+	(void)eventType; (void)e; (void)userData;
+	if (tcpDemoStream.writeFile)
+		fflush(tcpDemoStream.writeFile);
+	Com_Printf("^5TCP demo stream (WebSocket): closed\n");
+	tcpDemoStream.done = qtrue;
+	return EM_TRUE;
+}
+
+/* -----------------------------------------------------------------------
+ * Emscripten fetch callbacks (HTTP/HTTPS streaming in the browser)
+ * ----------------------------------------------------------------------- */
+
+static void CL_EmFetchOnProgress(emscripten_fetch_t *fetch)
+{
+	/* EMSCRIPTEN_FETCH_STREAM_DATA: fetch->data holds only the NEW bytes
+	 * received since the last onprogress call. */
+	if (fetch->numBytes > 0 && httpDemoStream.writeFile) {
+		fwrite(fetch->data, 1, (size_t)fetch->numBytes, httpDemoStream.writeFile);
+		fflush(httpDemoStream.writeFile);
+	}
+}
+
+static void CL_EmFetchOnSuccess(emscripten_fetch_t *fetch)
+{
+	/* Final progress chunk (if any). */
+	CL_EmFetchOnProgress(fetch);
+	if (httpDemoStream.writeFile)
+		fflush(httpDemoStream.writeFile);
+	Com_Printf("^5HTTP demo stream: download complete\n");
+	httpDemoStream.done    = qtrue;
+	httpDemoStream.emFetch = NULL;
+	emscripten_fetch_close(fetch);
+}
+
+static void CL_EmFetchOnError(emscripten_fetch_t *fetch)
+{
+	Com_Printf("^1HTTP demo stream: download error (HTTP %d)\n",
+		(int)fetch->status);
+	if (httpDemoStream.writeFile)
+		fflush(httpDemoStream.writeFile);
+	httpDemoStream.error   = qtrue;
+	httpDemoStream.done    = qtrue;
+	httpDemoStream.emFetch = NULL;
+	emscripten_fetch_close(fetch);
+}
+
+#endif /* __EMSCRIPTEN__ */
+
+/* -----------------------------------------------------------------------
+ * Native thread entry point (POSIX / Win32 only — not used in browser)
+ * ----------------------------------------------------------------------- */
+#if !defined(__EMSCRIPTEN__)
+
 #ifdef _WIN32
 static DWORD WINAPI CL_TcpDemoStreamThread(LPVOID arg)
 #else
@@ -3362,6 +3482,8 @@ static void *CL_TcpDemoStreamThread(void *arg)
 #endif
 }
 
+#endif /* !__EMSCRIPTEN__ */
+
 /*
  * Start a TCP demo stream from tcp://host:port[/optional-path].
  * Creates a temp file, spawns a thread, and fills tempPath so the
@@ -3425,15 +3547,44 @@ static qboolean CL_StartTcpDemoStream(const char *url, char *tempPathOut, int te
 	Q_strncpyz(tcpDemoStream.host, hostPort, sizeof(tcpDemoStream.host));
 	Q_strncpyz(tcpDemoStream.tempPath, tempPathOut, sizeof(tcpDemoStream.tempPath));
 
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+	{
+		/* Browser: open a WebSocket to ws://host:port[/path] */
+		EmscriptenWebSocketCreateAttributes wsAttr;
+		EMSCRIPTEN_WEBSOCKET_T              ws;
+		char                                wsUrl[MAX_OSPATH];
+		/* Preserve the path component from the original tcp:// URL */
+		const char *pathStart = strchr(url + 6, '/');
+		Com_sprintf(wsUrl, sizeof(wsUrl), "ws://%s:%d%s",
+			tcpDemoStream.host, tcpDemoStream.port,
+			pathStart ? pathStart : "/");
+
+		memset(&wsAttr, 0, sizeof(wsAttr));
+		wsAttr.url       = wsUrl;
+		wsAttr.protocols = "binary";
+
+		ws = emscripten_websocket_new(&wsAttr);
+		if (ws <= 0) {
+			Com_Printf("^1TCP demo stream: WebSocket create failed for '%s'\n", wsUrl);
+			fclose(writeFile);
+			remove(tempPathOut);
+			memset(&tcpDemoStream, 0, sizeof(tcpDemoStream));
+			tcpDemoStream.sock = CL_DEMO_INVALID_SOCK;
+			return qfalse;
+		}
+
+		tcpDemoStream.wsSocket = (int)ws;
+		emscripten_websocket_set_onopen_callback(   ws, NULL, CL_WsDemoOnOpen);
+		emscripten_websocket_set_onmessage_callback(ws, NULL, CL_WsDemoOnMessage);
+		emscripten_websocket_set_onerror_callback(  ws, NULL, CL_WsDemoOnError);
+		emscripten_websocket_set_onclose_callback(  ws, NULL, CL_WsDemoOnClose);
+
+		Com_Printf("^5TCP demo stream: connecting via WebSocket to '%s' ...\n", wsUrl);
+	}
+#elif defined(_WIN32)
 	tcpDemoStream.thread = CreateThread(NULL, 0,
 		CL_TcpDemoStreamThread, &tcpDemoStream, 0, NULL);
-	if (!tcpDemoStream.thread)
-#else
-	if (pthread_create(&tcpDemoStream.thread, NULL,
-		CL_TcpDemoStreamThread, &tcpDemoStream) != 0)
-#endif
-	{
+	if (!tcpDemoStream.thread) {
 		Com_Printf("^1TCP demo stream: could not create thread\n");
 		fclose(writeFile);
 		remove(tempPathOut);
@@ -3441,25 +3592,33 @@ static qboolean CL_StartTcpDemoStream(const char *url, char *tempPathOut, int te
 		tcpDemoStream.sock = CL_DEMO_INVALID_SOCK;
 		return qfalse;
 	}
-
 	Com_Printf("^5TCP demo stream: connecting to %s:%d ...\n", hostPort, port);
+#else  /* POSIX */
+	if (pthread_create(&tcpDemoStream.thread, NULL,
+		CL_TcpDemoStreamThread, &tcpDemoStream) != 0) {
+		Com_Printf("^1TCP demo stream: could not create thread\n");
+		fclose(writeFile);
+		remove(tempPathOut);
+		memset(&tcpDemoStream, 0, sizeof(tcpDemoStream));
+		tcpDemoStream.sock = CL_DEMO_INVALID_SOCK;
+		return qfalse;
+	}
+	Com_Printf("^5TCP demo stream: connecting to %s:%d ...\n", hostPort, port);
+#endif
+
 	return qtrue;
 }
 
 /*
  * Start an HTTP/HTTPS demo stream.
- * The download is handled by curl-multi (polled each frame in CL_Frame).
+ * - Emscripten: uses emscripten_fetch with EMSCRIPTEN_FETCH_STREAM_DATA so
+ *   data is written to the temp file progressively via callbacks.
+ * - Native (USE_HTTP): uses curl-multi, polled each frame from CL_Frame.
  * Returns qtrue on success.
  */
 static qboolean CL_StartHttpDemoStream(const char *url, char *tempPathOut, int tempPathSize)
 {
-#ifdef USE_HTTP
 	FILE *writeFile;
-
-	if (!CL_HTTP_Available()) {
-		Com_Printf("^1HTTP demo stream: HTTP support not available\n");
-		return qfalse;
-	}
 
 	CL_CleanupDemoStreams();
 
@@ -3470,24 +3629,61 @@ static qboolean CL_StartHttpDemoStream(const char *url, char *tempPathOut, int t
 		return qfalse;
 	}
 
-	if (!CL_HTTP_BeginDemoStream(url, writeFile)) {
-		fclose(writeFile);
-		remove(tempPathOut);
-		return qfalse;
-	}
-
 	memset(&httpDemoStream, 0, sizeof(httpDemoStream));
 	httpDemoStream.writeFile = writeFile;
 	httpDemoStream.active    = qtrue;
 	Q_strncpyz(httpDemoStream.tempPath, tempPathOut, sizeof(httpDemoStream.tempPath));
 
+#ifdef __EMSCRIPTEN__
+	{
+		emscripten_fetch_attr_t  attr;
+		emscripten_fetch_t      *fetch;
+
+		emscripten_fetch_attr_init(&attr);
+		Com_Memcpy(attr.requestMethod, "GET", 4);
+		/* STREAM_DATA: onprogress receives only the new bytes each call. */
+		attr.attributes = EMSCRIPTEN_FETCH_STREAM_DATA;
+		attr.onprogress = CL_EmFetchOnProgress;
+		attr.onsuccess  = CL_EmFetchOnSuccess;
+		attr.onerror    = CL_EmFetchOnError;
+
+		fetch = emscripten_fetch(&attr, url);
+		if (!fetch) {
+			Com_Printf("^1HTTP demo stream: emscripten_fetch failed for '%s'\n", url);
+			fclose(writeFile);
+			remove(tempPathOut);
+			memset(&httpDemoStream, 0, sizeof(httpDemoStream));
+			return qfalse;
+		}
+		httpDemoStream.emFetch = (void *)fetch;
+		Com_Printf("^5HTTP demo stream: fetching '%s' ...\n", url);
+	}
+#elif defined(USE_HTTP)
+	if (!CL_HTTP_Available()) {
+		Com_Printf("^1HTTP demo stream: HTTP support not available\n");
+		fclose(writeFile);
+		remove(tempPathOut);
+		memset(&httpDemoStream, 0, sizeof(httpDemoStream));
+		return qfalse;
+	}
+
+	if (!CL_HTTP_BeginDemoStream(url, writeFile)) {
+		fclose(writeFile);
+		remove(tempPathOut);
+		memset(&httpDemoStream, 0, sizeof(httpDemoStream));
+		return qfalse;
+	}
 	Com_Printf("^5HTTP demo stream: downloading '%s' ...\n", url);
-	return qtrue;
 #else
-	(void)url; (void)tempPathOut; (void)tempPathSize;
+	(void)url;
 	Com_Printf("^1HTTP demo stream: not compiled with HTTP support\n");
+	fclose(writeFile);
+	remove(tempPathOut);
+	memset(&httpDemoStream, 0, sizeof(httpDemoStream));
 	return qfalse;
 #endif
+
+	return qtrue;
 }
 
 /*

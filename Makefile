@@ -1165,6 +1165,12 @@ ifeq ($(PLATFORM),emscripten)
 
   CLIENT_CFLAGS+=-s USE_SDL=2
 
+  # Demo streaming: WebSocket (for /streamdemo tcp://) and Fetch (for /demo https://).
+  # -lwebsocket.js provides the emscripten_websocket_* API (tcp:// → ws://).
+  # -s FETCH=1 enables the emscripten_fetch API (http/https download).
+  CLIENT_LDFLAGS+=-lwebsocket.js
+  CLIENT_LDFLAGS+=-s FETCH=1
+
   CLIENT_LDFLAGS+=-s TOTAL_MEMORY=256MB
   CLIENT_LDFLAGS+=-s STACK_SIZE=5MB
   CLIENT_LDFLAGS+=-s MIN_WEBGL_VERSION=1 -s MAX_WEBGL_VERSION=2
