@@ -29,6 +29,60 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../sys/sys_loadlib.h"
 #include <limits.h>
 
+/* --- TCP / HTTP demo streaming ----------------------------------------- */
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+   typedef SOCKET clDemoSock_t;
+#  define CL_DEMO_INVALID_SOCK  INVALID_SOCKET
+#  define cl_demo_closesocket   closesocket
+#else
+#  include <sys/socket.h>
+#  include <netdb.h>
+#  include <unistd.h>
+#  include <pthread.h>
+   typedef int clDemoSock_t;
+#  define CL_DEMO_INVALID_SOCK  (-1)
+#  define cl_demo_closesocket   close
+#endif
+
+typedef struct {
+	volatile int   stop;       /* set != 0 to ask the thread to exit */
+	clDemoSock_t   sock;       /* TCP socket; CL_DEMO_INVALID_SOCK when closed */
+	FILE          *writeFile;  /* temp file for writing (thread) / reading (FS) */
+	char           tempPath[MAX_OSPATH];
+	char           host[512];
+	int            port;
+	qboolean       active;
+	qboolean       done;
+	qboolean       error;
+#ifdef _WIN32
+	HANDLE         thread;
+#else
+	pthread_t      thread;
+#endif
+} clTcpDemoStream_t;
+
+static clTcpDemoStream_t tcpDemoStream;
+
+typedef struct {
+	FILE     *writeFile;
+	char      tempPath[MAX_OSPATH];
+	qboolean  active;
+	qboolean  done;
+	qboolean  error;
+} clHttpDemoStream_t;
+
+static clHttpDemoStream_t httpDemoStream;
+
+/* Forward declarations for demo stream helpers (defined later, near the
+ * /streamdemo and /demo command handlers). */
+static void CL_CleanupDemoStreams(void);
+
 #ifdef USE_LOCAL_HEADERS
 #       include "SDL_opengl.h"
 #else
@@ -1035,6 +1089,9 @@ void CL_DemoCompleted( void )
 			}
 		}
 	}
+
+	/* clean up any active TCP or HTTP demo stream */
+	CL_CleanupDemoStreams();
 
 	CL_Disconnect( qtrue );
 	CL_NextDemo();
@@ -3142,6 +3199,297 @@ done:
 	return file;
 }
 
+/* -----------------------------------------------------------------------
+ * TCP / HTTP demo stream helpers
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Build a platform-appropriate temp file path for demo streaming.
+ * The caller supplies a unique id (e.g. Sys_Milliseconds()) so that
+ * concurrent invocations don't collide.
+ */
+static void CL_DemoStream_TempPath(char *buf, int bufSize, int id)
+{
+#ifdef _WIN32
+	const char *tmp = getenv("TEMP");
+	if (!tmp) tmp = getenv("TMP");
+	if (!tmp) tmp = "C:\\Temp";
+	Com_sprintf(buf, bufSize, "%s\\wolfcamql_demostream_%d.dm_91", tmp, id);
+#else
+	Com_sprintf(buf, bufSize, "/tmp/wolfcamql_demostream_%d.dm_91", id);
+#endif
+}
+
+/*
+ * Open the temp path for reading via the FS layer.
+ * Returns 0 on failure.
+ */
+static qhandle_t CL_DemoStream_OpenForRead(const char *path)
+{
+	qhandle_t f = 0;
+	FS_FOpenSysFileRead(path, &f);
+	return f;
+}
+
+/*
+ * Clean up both the TCP and HTTP demo streams.
+ * Safe to call at any time; does nothing if not active.
+ */
+static void CL_CleanupDemoStreams(void)
+{
+	/* --- TCP --- */
+	if (tcpDemoStream.active) {
+		tcpDemoStream.stop = 1;
+		/* close the socket to unblock the recv() in the thread */
+		if (tcpDemoStream.sock != CL_DEMO_INVALID_SOCK) {
+			cl_demo_closesocket(tcpDemoStream.sock);
+			tcpDemoStream.sock = CL_DEMO_INVALID_SOCK;
+		}
+#ifdef _WIN32
+		if (tcpDemoStream.thread) {
+			WaitForSingleObject(tcpDemoStream.thread, 5000);
+			CloseHandle(tcpDemoStream.thread);
+			tcpDemoStream.thread = NULL;
+		}
+#else
+		pthread_join(tcpDemoStream.thread, NULL);
+#endif
+		if (tcpDemoStream.writeFile) {
+			fclose(tcpDemoStream.writeFile);
+			tcpDemoStream.writeFile = NULL;
+		}
+		if (tcpDemoStream.tempPath[0]) {
+			remove(tcpDemoStream.tempPath);
+			tcpDemoStream.tempPath[0] = '\0';
+		}
+		memset(&tcpDemoStream, 0, sizeof(tcpDemoStream));
+		tcpDemoStream.sock = CL_DEMO_INVALID_SOCK;
+	}
+
+	/* --- HTTP --- */
+	if (httpDemoStream.active) {
+#ifdef USE_HTTP
+		CL_HTTP_AbortDemoStream();
+#endif
+		if (httpDemoStream.writeFile) {
+			fclose(httpDemoStream.writeFile);
+			httpDemoStream.writeFile = NULL;
+		}
+		if (httpDemoStream.tempPath[0]) {
+			remove(httpDemoStream.tempPath);
+			httpDemoStream.tempPath[0] = '\0';
+		}
+		memset(&httpDemoStream, 0, sizeof(httpDemoStream));
+	}
+}
+
+/* Thread entry point: connect to host:port and pipe bytes to writeFile. */
+#ifdef _WIN32
+static DWORD WINAPI CL_TcpDemoStreamThread(LPVOID arg)
+#else
+static void *CL_TcpDemoStreamThread(void *arg)
+#endif
+{
+	clTcpDemoStream_t *s = (clTcpDemoStream_t *)arg;
+	struct addrinfo    hints, *res = NULL, *rp;
+	char               portStr[16];
+	clDemoSock_t       sock = CL_DEMO_INVALID_SOCK;
+	char               buf[65536];
+	int                n;
+
+	Com_sprintf(portStr, sizeof(portStr), "%d", s->port);
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family   = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_protocol = IPPROTO_TCP;
+
+	if (getaddrinfo(s->host, portStr, &hints, &res) != 0) {
+		Com_Printf("^1TCP demo stream: getaddrinfo failed for '%s'\n", s->host);
+		s->error = qtrue;
+		s->done  = qtrue;
+#ifdef _WIN32
+		return 1;
+#else
+		return NULL;
+#endif
+	}
+
+	for (rp = res; rp; rp = rp->ai_next) {
+		sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+		if (sock == CL_DEMO_INVALID_SOCK) continue;
+		if (connect(sock, rp->ai_addr, (int)rp->ai_addrlen) == 0) break;
+		cl_demo_closesocket(sock);
+		sock = CL_DEMO_INVALID_SOCK;
+	}
+	freeaddrinfo(res);
+
+	if (sock == CL_DEMO_INVALID_SOCK) {
+		Com_Printf("^1TCP demo stream: could not connect to '%s:%d'\n",
+			s->host, s->port);
+		s->error = qtrue;
+		s->done  = qtrue;
+#ifdef _WIN32
+		return 1;
+#else
+		return NULL;
+#endif
+	}
+
+	s->sock = sock;
+	Com_Printf("^5TCP demo stream: connected to '%s:%d'\n", s->host, s->port);
+
+	while (!s->stop) {
+#ifdef _WIN32
+		n = recv(sock, buf, (int)sizeof(buf), 0);
+#else
+		n = (int)recv(sock, buf, sizeof(buf), 0);
+#endif
+		if (n <= 0) break;
+		fwrite(buf, 1, (size_t)n, s->writeFile);
+		fflush(s->writeFile);
+	}
+
+	cl_demo_closesocket(sock);
+	s->sock = CL_DEMO_INVALID_SOCK;
+	fflush(s->writeFile);
+	Com_Printf("^5TCP demo stream: connection closed\n");
+	s->done = qtrue;
+
+#ifdef _WIN32
+	return 0;
+#else
+	return NULL;
+#endif
+}
+
+/*
+ * Start a TCP demo stream from tcp://host:port[/optional-path].
+ * Creates a temp file, spawns a thread, and fills tempPath so the
+ * caller can open it for reading.
+ * Returns qtrue on success.
+ */
+static qboolean CL_StartTcpDemoStream(const char *url, char *tempPathOut, int tempPathSize)
+{
+	const char *p;
+	char        hostPort[512];
+	char       *colon;
+	int         port;
+	FILE       *writeFile;
+
+	if (Q_stricmpn(url, "tcp://", 6) != 0)
+		return qfalse;
+
+	p = url + 6;
+
+	/* extract host:port (up to the first '/' or end of string) */
+	{
+		const char *slash = strchr(p, '/');
+		int         len   = slash ? (int)(slash - p) : (int)strlen(p);
+
+		if (len <= 0 || len >= (int)sizeof(hostPort)) {
+			Com_Printf("^1TCP demo stream: malformed URL '%s'\n", url);
+			return qfalse;
+		}
+		memcpy(hostPort, p, len);
+		hostPort[len] = '\0';
+	}
+
+	colon = strrchr(hostPort, ':');
+	if (!colon) {
+		Com_Printf("^1TCP demo stream: no port found in URL '%s'\n", url);
+		return qfalse;
+	}
+	*colon = '\0';
+	port   = atoi(colon + 1);
+	if (port <= 0 || port > 65535) {
+		Com_Printf("^1TCP demo stream: invalid port in URL '%s'\n", url);
+		return qfalse;
+	}
+
+	CL_CleanupDemoStreams();
+
+	/* create the temp file that will be written by the thread and read by FS */
+	CL_DemoStream_TempPath(tempPathOut, tempPathSize, Sys_Milliseconds());
+	writeFile = fopen(tempPathOut, "wb");
+	if (!writeFile) {
+		Com_Printf("^1TCP demo stream: could not create temp file '%s'\n", tempPathOut);
+		return qfalse;
+	}
+
+	memset(&tcpDemoStream, 0, sizeof(tcpDemoStream));
+	tcpDemoStream.sock      = CL_DEMO_INVALID_SOCK;
+	tcpDemoStream.writeFile = writeFile;
+	tcpDemoStream.stop      = 0;
+	tcpDemoStream.active    = qtrue;
+	tcpDemoStream.port      = port;
+	Q_strncpyz(tcpDemoStream.host, hostPort, sizeof(tcpDemoStream.host));
+	Q_strncpyz(tcpDemoStream.tempPath, tempPathOut, sizeof(tcpDemoStream.tempPath));
+
+#ifdef _WIN32
+	tcpDemoStream.thread = CreateThread(NULL, 0,
+		CL_TcpDemoStreamThread, &tcpDemoStream, 0, NULL);
+	if (!tcpDemoStream.thread)
+#else
+	if (pthread_create(&tcpDemoStream.thread, NULL,
+		CL_TcpDemoStreamThread, &tcpDemoStream) != 0)
+#endif
+	{
+		Com_Printf("^1TCP demo stream: could not create thread\n");
+		fclose(writeFile);
+		remove(tempPathOut);
+		memset(&tcpDemoStream, 0, sizeof(tcpDemoStream));
+		tcpDemoStream.sock = CL_DEMO_INVALID_SOCK;
+		return qfalse;
+	}
+
+	Com_Printf("^5TCP demo stream: connecting to %s:%d ...\n", hostPort, port);
+	return qtrue;
+}
+
+/*
+ * Start an HTTP/HTTPS demo stream.
+ * The download is handled by curl-multi (polled each frame in CL_Frame).
+ * Returns qtrue on success.
+ */
+static qboolean CL_StartHttpDemoStream(const char *url, char *tempPathOut, int tempPathSize)
+{
+#ifdef USE_HTTP
+	FILE *writeFile;
+
+	if (!CL_HTTP_Available()) {
+		Com_Printf("^1HTTP demo stream: HTTP support not available\n");
+		return qfalse;
+	}
+
+	CL_CleanupDemoStreams();
+
+	CL_DemoStream_TempPath(tempPathOut, tempPathSize, Sys_Milliseconds());
+	writeFile = fopen(tempPathOut, "wb");
+	if (!writeFile) {
+		Com_Printf("^1HTTP demo stream: could not create temp file '%s'\n", tempPathOut);
+		return qfalse;
+	}
+
+	if (!CL_HTTP_BeginDemoStream(url, writeFile)) {
+		fclose(writeFile);
+		remove(tempPathOut);
+		return qfalse;
+	}
+
+	memset(&httpDemoStream, 0, sizeof(httpDemoStream));
+	httpDemoStream.writeFile = writeFile;
+	httpDemoStream.active    = qtrue;
+	Q_strncpyz(httpDemoStream.tempPath, tempPathOut, sizeof(httpDemoStream.tempPath));
+
+	Com_Printf("^5HTTP demo stream: downloading '%s' ...\n", url);
+	return qtrue;
+#else
+	(void)url; (void)tempPathOut; (void)tempPathSize;
+	Com_Printf("^1HTTP demo stream: not compiled with HTTP support\n");
+	return qfalse;
+#endif
+}
+
 /*
 ====================
 CL_PlayDemo_f
@@ -3186,6 +3534,49 @@ void CL_PlayDemo_f (void)
 	}
 
 	arg = DemoNames[0];
+
+	// handle http/https URLs: stream the demo file from a remote server
+	if (!Q_stricmpn(arg, "http://", 7) || !Q_stricmpn(arg, "https://", 8)) {
+		char tempPath[MAX_OSPATH];
+
+		CL_Disconnect( qtrue );
+
+		if (!CL_StartHttpDemoStream(arg, tempPath, sizeof(tempPath))) {
+			return;
+		}
+
+		clc.demoReadFile = CL_DemoStream_OpenForRead(tempPath);
+		if (!clc.demoReadFile) {
+			Com_Printf("^1CL_PlayDemo_f: could not open temp file for reading\n");
+			CL_CleanupDemoStreams();
+			return;
+		}
+
+		//FIXME
+		memset(&di, 0, sizeof(di));
+		for (i = 0;  i < MAX_DEMO_FILES;  i++) {
+			di.demoFiles[i].num = i;
+		}
+		di.demoFiles[0].f = clc.demoReadFile;
+		di.demoFiles[0].valid = qtrue;
+		di.numDemoFiles++;
+
+		di.streaming = qtrue;
+
+		Con_Close();
+
+		// CL_CheckWorkshopDownload() advances to CA_CONNECTED
+		clc.state = CA_DOWNLOADINGWORKSHOPS;
+		clc.demoplaying = qtrue;
+		clc.demoPlayBegin = Sys_Milliseconds();
+
+		clc.demoWorkshopsString = NULL;
+		Q_strncpyz( clc.servername, arg, sizeof( clc.servername ) );
+
+		Com_Printf("^5HTTP demo stream: checking workshops\n");
+		CL_CheckWorkshopDownload();
+		return;
+	}
 
 	CL_Disconnect( qtrue );
 
@@ -3300,6 +3691,52 @@ void CL_StreamDemo_f (void)
 #endif
 
 	arg = Cmd_Argv(1);
+
+	// handle tcp:// URL: receive a live demo stream over TCP
+	if (!Q_stricmpn(arg, "tcp://", 6)) {
+		char tempPath[MAX_OSPATH];
+
+		CL_Disconnect( qtrue );
+
+		if (!CL_StartTcpDemoStream(arg, tempPath, sizeof(tempPath))) {
+			return;
+		}
+
+		clc.demoReadFile = CL_DemoStream_OpenForRead(tempPath);
+		if (!clc.demoReadFile) {
+			Com_Printf("^1CL_StreamDemo_f: could not open temp file for reading\n");
+			CL_CleanupDemoStreams();
+			return;
+		}
+
+		//FIXME
+		memset(&di, 0, sizeof(di));
+		for (i = 0;  i < MAX_DEMO_FILES;  i++) {
+			di.demoFiles[i].num = i;
+		}
+		di.demoFiles[0].f = clc.demoReadFile;
+		di.demoFiles[0].valid = qtrue;
+		di.numDemoFiles++;
+
+		di.streaming = qtrue;
+
+		Con_Close();
+
+		//parse_demo();
+		//FIXME without parse_demo() how do you check for protocol <= 48?
+
+		// CL_CheckWorkshopDownload() advances to CA_CONNECTED
+		clc.state = CA_DOWNLOADINGWORKSHOPS;
+		clc.demoplaying = qtrue;
+		clc.demoPlayBegin = Sys_Milliseconds();
+
+		clc.demoWorkshopsString = NULL;
+		Q_strncpyz( clc.servername, arg, sizeof( clc.servername ) );
+
+		Com_Printf("^5TCP demo stream: checking workshops\n");
+		CL_CheckWorkshopDownload();
+		return;
+	}
 
 	CL_Disconnect( qtrue );
 
@@ -5610,6 +6047,22 @@ void CL_Frame ( int msec, double fmsec ) {
 			Con_RunConsole();
 			cls.framecount++;
 			return;
+		}
+	}
+#endif
+
+	/* Poll HTTP demo stream (curl-multi, non-blocking).
+	 * The streaming mechanism in CL_ReadDemoMessage handles the case
+	 * where data has not arrived yet, so no special logic is needed here
+	 * beyond advancing the curl download each frame. */
+#ifdef USE_HTTP
+	if (httpDemoStream.active && !httpDemoStream.done) {
+		if (CL_HTTP_PollDemoStream()) {
+			httpDemoStream.done = qtrue;
+			/* writeFile stays open; FS still reads from the temp file.
+			 * The EOF / -1 end-of-demo marker in the stream signals
+			 * CL_ReadDemoMessage to call CL_DemoCompleted(). */
+			Com_Printf("^5HTTP demo stream: download complete\n");
 		}
 	}
 #endif

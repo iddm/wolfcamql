@@ -159,4 +159,22 @@ qboolean CL_HTTP_PerformDownload(void)
     return qtrue;
 }
 
+/* Demo streaming stubs — not implemented on the Windows (WinINet) backend.
+ * Use the curl backend (cl_http_curl.c) on Windows for demo streaming. */
+qboolean CL_HTTP_BeginDemoStream(const char *url, FILE *outFile)
+{
+    (void)url; (void)outFile;
+    Com_Printf("^3HTTP demo stream: not supported on this HTTP backend\n");
+    return qfalse;
+}
+
+qboolean CL_HTTP_PollDemoStream(void)
+{
+    return qtrue; /* nothing active */
+}
+
+void CL_HTTP_AbortDemoStream(void)
+{
+}
+
 #endif /* USE_HTTP */
