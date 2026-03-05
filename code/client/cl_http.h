@@ -31,4 +31,10 @@ void CL_HTTP_Shutdown( void );
 void CL_HTTP_BeginDownload( const char *remoteURL );
 qboolean CL_HTTP_PerformDownload( void );
 
+/* Demo streaming via HTTP/HTTPS: write received bytes to outFile. */
+qboolean CL_HTTP_BeginDemoStream( const char *url, FILE *outFile );
+/* Returns qtrue when the transfer is complete or has failed. */
+qboolean CL_HTTP_PollDemoStream( void );
+void     CL_HTTP_AbortDemoStream( void );
+
 #endif	// __CL_HTTP_H__

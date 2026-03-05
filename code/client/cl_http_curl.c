@@ -349,4 +349,149 @@ qboolean CL_HTTP_PerformDownload(void)
 	return qtrue;
 }
 
+/* -----------------------------------------------------------------------
+ * Demo streaming via HTTP/HTTPS
+ * The received bytes are written directly to a caller-supplied FILE*.
+ * The caller opens that same file with FS_FOpenSysFileRead and plays it
+ * with di.streaming = qtrue so playback starts as soon as data arrives.
+ * ----------------------------------------------------------------------- */
+
+static CURL  *demoCURL  = NULL;
+static CURLM *demoCURLM = NULL;
+static FILE  *demoWriteFile = NULL;
+
+static size_t CL_cURL_DemoStreamWrite(void *buffer, size_t size, size_t nmemb,
+	void *userdata)
+{
+	FILE *f = (FILE *)userdata;
+	size_t written = fwrite(buffer, size, nmemb, f);
+	fflush(f);
+	return written;
+}
+
+qboolean CL_HTTP_BeginDemoStream(const char *url, FILE *outFile)
+{
+	CURLMcode result;
+
+	/* clean up any previous demo stream */
+	CL_HTTP_AbortDemoStream();
+
+	if (!outFile) {
+		Com_Printf("^1CL_HTTP_BeginDemoStream: NULL output file\n");
+		return qfalse;
+	}
+
+	demoCURL = qcurl_easy_init();
+	if (!demoCURL) {
+		Com_Printf("^1CL_HTTP_BeginDemoStream: qcurl_easy_init() failed\n");
+		return qfalse;
+	}
+
+	demoWriteFile = outFile;
+
+	if (com_developer->integer)
+		qcurl_easy_setopt(demoCURL, CURLOPT_VERBOSE, 1L);
+	qcurl_easy_setopt(demoCURL, CURLOPT_URL,              url);
+	qcurl_easy_setopt(demoCURL, CURLOPT_TRANSFERTEXT,     0L);
+	qcurl_easy_setopt(demoCURL, CURLOPT_USERAGENT,        va("%s %s", Q3_VERSION, qcurl_version()));
+	qcurl_easy_setopt(demoCURL, CURLOPT_WRITEFUNCTION,    CL_cURL_DemoStreamWrite);
+	qcurl_easy_setopt(demoCURL, CURLOPT_WRITEDATA,        demoWriteFile);
+	qcurl_easy_setopt(demoCURL, CURLOPT_NOPROGRESS,       1L);
+	qcurl_easy_setopt(demoCURL, CURLOPT_FAILONERROR,      1L);
+	qcurl_easy_setopt(demoCURL, CURLOPT_FOLLOWLOCATION,   1L);
+	qcurl_easy_setopt(demoCURL, CURLOPT_MAXREDIRS,        5L);
+#if CURL_AT_LEAST_VERSION(7,85,0)
+	qcurl_easy_setopt(demoCURL, CURLOPT_PROTOCOLS_STR,    "http,https");
+#else
+	qcurl_easy_setopt(demoCURL, CURLOPT_PROTOCOLS,
+		(long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
+	qcurl_easy_setopt(demoCURL, CURLOPT_BUFFERSIZE, (long)CURL_MAX_READ_SIZE);
+
+	demoCURLM = qcurl_multi_init();
+	if (!demoCURLM) {
+		qcurl_easy_cleanup(demoCURL);
+		demoCURL = NULL;
+		Com_Printf("^1CL_HTTP_BeginDemoStream: qcurl_multi_init() failed\n");
+		return qfalse;
+	}
+
+	result = qcurl_multi_add_handle(demoCURLM, demoCURL);
+	if (result != CURLM_OK) {
+		qcurl_easy_cleanup(demoCURL);
+		demoCURL = NULL;
+		qcurl_multi_cleanup(demoCURLM);
+		demoCURLM = NULL;
+		Com_Printf("^1CL_HTTP_BeginDemoStream: qcurl_multi_add_handle() failed: %s\n",
+			qcurl_multi_strerror(result));
+		return qfalse;
+	}
+
+	return qtrue;
+}
+
+qboolean CL_HTTP_PollDemoStream(void)
+{
+	CURLMcode res;
+	CURLMsg   *msg;
+	int        running, c;
+
+	if (!demoCURLM)
+		return qtrue; /* nothing active, treat as done */
+
+	running = 0;
+	res = qcurl_multi_perform(demoCURLM, &running);
+	if (res == CURLM_CALL_MULTI_PERFORM) {
+		/* need to call again immediately; do so a few more times */
+		int i;
+		for (i = 0; i < 8 && res == CURLM_CALL_MULTI_PERFORM; i++)
+			res = qcurl_multi_perform(demoCURLM, &running);
+	}
+
+	msg = qcurl_multi_info_read(demoCURLM, &c);
+	if (msg == NULL)
+		return qfalse; /* still in progress */
+
+	if (msg->msg == CURLMSG_DONE) {
+		if (msg->data.result != CURLE_OK) {
+			long code = 0;
+			qcurl_easy_getinfo(demoCURL, CURLINFO_RESPONSE_CODE, &code);
+			Com_Printf("^1HTTP demo stream error: %s (HTTP %ld)\n",
+				qcurl_easy_strerror(msg->data.result), code);
+		}
+	}
+
+	/* transfer finished (success or error) */
+	if (demoWriteFile) {
+		fflush(demoWriteFile);
+	}
+	qcurl_multi_remove_handle(demoCURLM, demoCURL);
+	qcurl_easy_cleanup(demoCURL);
+	demoCURL = NULL;
+	qcurl_multi_cleanup(demoCURLM);
+	demoCURLM = NULL;
+	demoWriteFile = NULL;
+	return qtrue;
+}
+
+void CL_HTTP_AbortDemoStream(void)
+{
+	if (demoCURLM) {
+		if (demoCURL) {
+			qcurl_multi_remove_handle(demoCURLM, demoCURL);
+			qcurl_easy_cleanup(demoCURL);
+			demoCURL = NULL;
+		}
+		qcurl_multi_cleanup(demoCURLM);
+		demoCURLM = NULL;
+	} else if (demoCURL) {
+		qcurl_easy_cleanup(demoCURL);
+		demoCURL = NULL;
+	}
+	if (demoWriteFile) {
+		fflush(demoWriteFile);
+		demoWriteFile = NULL;
+	}
+}
+
 #endif /* USE_HTTP */
