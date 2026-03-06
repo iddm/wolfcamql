@@ -159,6 +159,20 @@ void GLimp_InitExtraExtensions(void)
 			ri.Printf(PRINT_ALL, result[2], extension);
 		}
 
+		// Framebuffer objects are core in OpenGL ES 2.0+ / WebGL2, not an
+		// extension.  Load the entry points unconditionally so that
+		// RE_GetShaderImageData can use a temporary FBO as a replacement for
+		// glGetTexImage (which doesn't exist in WebGL2).
+		//
+		// NOTE: we deliberately do NOT set glRefConfig.framebufferObject here.
+		// That flag enables the full FBO rendering pipeline (FBO_Init, HDR
+		// render targets, etc.) which uses float texture formats that require
+		// EXT_color_buffer_float and would crash on WebGL2 without it.
+		// RE_GetShaderImageData guards its FBO path with qglGenFramebuffers != NULL
+		// rather than glRefConfig.framebufferObject.
+		QGL_ARB_framebuffer_object_PROCS;
+		ri.Printf(PRINT_ALL, "...loaded OpenGL ES framebuffer object entry points (core in ES 2.0+)\n");
+
 		goto done;
 	}
 

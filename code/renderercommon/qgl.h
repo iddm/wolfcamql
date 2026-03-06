@@ -102,7 +102,7 @@ extern GLvoid (APIENTRYP qglBlitFramebufferEXT) (GLint srcX0, GLint srcY0, GLint
 	GLE(GLenum, GetError, void) \
 	GLE(void, GetIntegerv, GLenum pname, GLint *params) \
 	GLE(const GLubyte *, GetString, GLenum name) \
-	GLE(void, GetTexImage, GLenum target, GLint level, GLenum format, GLenum type, GLvoid * pixels) \
+	/* GetTexImage removed — desktop-only, not available in OpenGL ES / WebGL2 */ \
 	GLE(void, LineWidth, GLfloat width) \
 	GLE(void, PixelStorei, GLenum pname, GLint param) \
 	GLE(void, PolygonOffset, GLfloat factor, GLfloat units) \
@@ -142,6 +142,7 @@ extern GLvoid (APIENTRYP qglBlitFramebufferEXT) (GLint srcX0, GLint srcY0, GLint
 	GLE(void, DepthRange, GLclampd near_val, GLclampd far_val) \
 	GLE(void, DrawBuffer, GLenum mode) \
 	GLE(void, PolygonMode, GLenum face, GLenum mode) \
+	GLE(void, GetTexImage, GLenum target, GLint level, GLenum format, GLenum type, GLvoid * pixels) \
 
 // OpenGL 1.0/1.1 but not OpenGL 3.2 core profile or OpenGL ES 1.x
 #define QGL_DESKTOP_1_1_FIXED_FUNCTION_PROCS \

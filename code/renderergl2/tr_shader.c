@@ -4298,41 +4298,39 @@ void RE_GetShaderImageData (qhandle_t h, ubyte *data)
 	//	R_SyncRenderThread();
 	//}
 
-	//FIXME glGetTexImage() not supported
+	// glGetTexImage() is not available in OpenGL ES / WebGL2.
+	// Use a temporary FBO + glReadPixels instead.
+	// qglGenFramebuffers is loaded unconditionally for GLES in
+	// GLimp_InitExtraExtensions() (tr_extensions.c) without enabling the
+	// full FBO rendering pipeline (glRefConfig.framebufferObject), so we
+	// check the function pointer directly rather than the capability flag.
 	if (qglesMajorVersion >= 1) {
 		int width, height;
-		GLuint fbo;
-		//FBO_t *fbo;
-		FBO_t *currentFbo;
+		GLuint tempFbo;
+		GLuint prevFbo;
 
-		//FIXME 2024-10-01  qglGenFramebuffers() crashing
-		//  from ioquake3 patch 2024-06-05-01 'OpenGL2: Add OpenGL ES 2.0+ support' :
-		//  "It's missing support for framebuffer objects which should be
-		// possible on ES 2."
-		return;
+		if (!qglGenFramebuffers)
+		{
+			ri.Printf(PRINT_WARNING, "RE_GetShaderImageData: glGenFramebuffers not available\n");
+			return;
+		}
 
-		currentFbo = glState.currentFBO;
+		width  = image->uploadWidth;
+		height = image->uploadHeight;
 
-		width = shader->stages[0]->bundle[0].image[0]->uploadWidth;
-		height = shader->stages[0]->bundle[0].image[0]->uploadHeight;
+		// Save the currently-bound framebuffer so we can restore it.
+		// We use raw GL calls throughout — FBO_Bind() is gated on
+		// glRefConfig.framebufferObject which we intentionally keep false.
+		qglGetIntegerv(GL_FRAMEBUFFER_BINDING, (GLint *)&prevFbo);
 
-		//ri.Printf(PRINT_ALL, "     %p qglGenFramebuffers\n", qglGenFramebuffers);
-		//fbo = FBO_Create("_getImage", width, height);
+		qglGenFramebuffers(1, &tempFbo);
+		qglBindFramebuffer(GL_FRAMEBUFFER, tempFbo);
 
-		qglGenFramebuffers(1, &fbo);
-
-		//FBO_Bind(fbo);
-		//ri.Printf(PRINT_ALL, "     done\n");
-
-		//qglBindFramebuffer(GL_FRAMEBUFFER, fbo);
 		qglFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texnum, 0);
-
 		qglReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, data);
 
-		//glBindFramebuffer(GL_FRAMEBUFFER, 0);
-		FBO_Bind(currentFbo);
-
-		//qglDeleteFramebuffers(1, &fbo);
+		qglBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+		qglDeleteFramebuffers(1, &tempFbo);
 
 		return;
 	}
