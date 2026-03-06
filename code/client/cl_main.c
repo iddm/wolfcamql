@@ -46,6 +46,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  * for HTTP/HTTPS.  Raw POSIX sockets and pthreads are not available. */
 #  include <emscripten/websocket.h>
 #  include <emscripten/fetch.h>
+#  include <sys/stat.h>
    typedef int clDemoSock_t;   /* unused; kept for uniform struct layout */
 #  define CL_DEMO_INVALID_SOCK  (-1)
 #  define cl_demo_closesocket(s) ((void)(s))
@@ -89,6 +90,7 @@ typedef struct {
 	qboolean  done;
 	qboolean  error;
 #ifdef __EMSCRIPTEN__
+	qboolean  waitingForFirstData;  /* defer opening for read until fetch has data */
 	void     *emFetch;   /* emscripten_fetch_t* */
 #endif
 } clHttpDemoStream_t;
@@ -3800,6 +3802,19 @@ void CL_PlayDemo_f (void)
 			return;
 		}
 
+#ifdef __EMSCRIPTEN__
+		/* Fetch is async; defer opening for read until onprogress has delivered data.
+		 * CL_Frame will open the file and set up playback when CL_StreamDemoFileSize() >= 8. */
+		httpDemoStream.waitingForFirstData = qtrue;
+		Con_Close();
+		clc.state = CA_DOWNLOADINGWORKSHOPS;
+		clc.demoWorkshopsString = NULL;
+		Q_strncpyz(clc.servername, arg, sizeof(clc.servername));
+		Com_Printf("^5HTTP demo stream: checking workshops\n");
+		CL_CheckWorkshopDownload();
+		return;
+#endif
+
 		clc.demoReadFile = CL_DemoStream_OpenForRead(tempPath);
 		if (!clc.demoReadFile) {
 			Com_Printf("^1CL_PlayDemo_f: could not open temp file for reading\n");
@@ -6318,6 +6333,42 @@ void CL_Frame ( int msec, double fmsec ) {
 			 * The EOF / -1 end-of-demo marker in the stream signals
 			 * CL_ReadDemoMessage to call CL_DemoCompleted(). */
 			Com_Printf("^5HTTP demo stream: download complete\n");
+		}
+	}
+#endif
+
+#ifdef __EMSCRIPTEN__
+	/* Emscripten: we deferred opening the demo file until the fetch delivered data.
+	 * Each frame check if we have enough data (or fetch finished); then open for read. */
+	if (httpDemoStream.active && httpDemoStream.waitingForFirstData) {
+		int size = CL_StreamDemoFileSize();
+		if (size >= 8) {
+			qhandle_t f;
+			int i;
+
+			httpDemoStream.waitingForFirstData = qfalse;
+			f = 0;
+			FS_FOpenSysFileRead(httpDemoStream.tempPath, &f);
+			if (!f) {
+				Com_Printf("^1HTTP demo stream: could not open temp file for reading\n");
+				CL_CleanupDemoStreams();
+				return;
+			}
+			clc.demoReadFile = f;
+			memset(&di, 0, sizeof(di));
+			for (i = 0; i < MAX_DEMO_FILES; i++)
+				di.demoFiles[i].num = i;
+			di.demoFiles[0].f = clc.demoReadFile;
+			di.demoFiles[0].valid = qtrue;
+			di.numDemoFiles = 1;
+			di.streaming = qtrue;
+			clc.demoplaying = qtrue;
+			clc.demoPlayBegin = Sys_Milliseconds();
+			Com_Printf("^5HTTP demo stream: data ready, starting playback\n");
+		} else if (httpDemoStream.done) {
+			/* Transfer finished but no/little data - error or empty response */
+			Com_Printf("^1HTTP demo stream: no data received\n");
+			CL_CleanupDemoStreams();
 		}
 	}
 #endif
