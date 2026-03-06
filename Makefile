@@ -1591,6 +1591,15 @@ $(echo_cmd) "REF_CC $<"
 $(Q)$(CC) $(SHLIBCFLAGS) $(CFLAGS) $(CLIENT_CFLAGS) $(OPTIMIZE) $(WARNINGS_CFLAGS) -o $@ -c $<
 endef
 
+# Like DO_CC but pre-includes the WebGPU stub qgl.h so that renderercommon
+# source files (tr_image_tga.c, tr_noise.c, …) compile without pulling in
+# the real OpenGL headers.
+define DO_RWGPU_RCOMMON_CC
+$(echo_cmd) "RWGPU_CC $<"
+$(Q)$(CC) $(NOTSHLIBCFLAGS) $(CFLAGS) $(CLIENT_CFLAGS) $(OPTIMIZE) $(WARNINGS_CFLAGS) \
+  -include $(RWGPUDIR)/qgl.h -o $@ -c $<
+endef
+
 define DO_THIRDPARTY_REF_CC
 $(echo_cmd) "THIRDPARTY_REF_CC $<"
 $(Q)$(CC) $(SHLIBCFLAGS) $(CFLAGS) $(CLIENT_CFLAGS) $(OPTIMIZE) $(THIRDPARTY_CFLAGS) -o $@ -c $<
@@ -2291,7 +2300,16 @@ Q3R2STRINGOBJ = \
   $(B)/renderergl2/glsl/tonemap_vp.o
 
 Q3RWGPUOBJ = \
-  $(B)/rendererwebgpu/tr_init.o
+  $(B)/rendererwebgpu/tr_init.o \
+  $(B)/rendererwebgpu/tr_image.o \
+  $(B)/rendererwebgpu/tr_shader.o \
+  $(B)/rendererwebgpu/tr_wgsl.o \
+  $(B)/rendererwebgpu/tr_backend.o \
+  $(B)/rendererwebgpu/tr_image_tga.o \
+  $(B)/rendererwebgpu/tr_image_jpg.o \
+  $(B)/rendererwebgpu/tr_image_png.o \
+  $(B)/rendererwebgpu/tr_noise.o \
+  $(B)/rendererwebgpu/tr_subs.o
 
 Q3ROBJ = \
   $(B)/renderergl1/tr_altivec.o \
@@ -3424,6 +3442,11 @@ $(B)/renderergl2/%.o: $(RGL2DIR)/%.c
 
 $(B)/rendererwebgpu/%.o: $(RWGPUDIR)/%.c
 	$(DO_CC)
+
+# renderercommon source files compiled into the WebGPU renderer context,
+# with the stub qgl.h pre-included to avoid pulling in real OpenGL headers.
+$(B)/rendererwebgpu/%.o: $(RCOMMONDIR)/%.c
+	$(DO_RWGPU_RCOMMON_CC)
 
 $(B)/ded/%.o: $(ASMDIR)/%.S
 	$(DO_AS)

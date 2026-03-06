@@ -20,266 +20,419 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 /*
- * WebGPU renderer stub for Emscripten.
+ * tr_init.c – WebGPU renderer initialisation and refexport_t interface.
  *
- * This file provides the renderer interface (refexport_t) backed by WebGPU
- * instead of OpenGL.  It is compiled when USE_WEBGPU=1 is set at build time
- * and replaces the renderergl2 + sdl_glimp objects in the link.
- *
- * Current state: scaffolding / stub.  Every refexport_t entry-point is
- * present so the binary links and launches; actual WebGPU draw calls are
- * left as TODO placeholders.
+ * Compiled only when USE_WEBGPU=1.  Links the WebGPU device / swap-chain
+ * setup with the Q3 renderer interface so the engine can use WebGPU instead
+ * of OpenGL/WebGL.
  */
 
 #ifdef USE_WEBGPU
 
-#include "../qcommon/q_shared.h"
-#include "../qcommon/qfiles.h"
-#include "../renderercommon/tr_public.h"
-
-#ifdef __EMSCRIPTEN__
-#include <SDL.h>
-#include <emscripten/html5_webgpu.h>
-#include <webgpu/webgpu.h>
-#endif
+#include "tr_local.h"
 
 /* =========================================================================
- * Module-level state
+ * Global state (definitions – declared extern in tr_local.h)
  * ========================================================================= */
 
-static refimport_t ri;
-static glconfig_t  glConfig;
+wgpuGlobals_t  wgpu;
+refimport_t    ri;
+glconfig_t     glConfig;
 
-#ifdef __EMSCRIPTEN__
-static SDL_Window *webgpu_window  = NULL;
-static WGPUDevice  webgpu_device  = NULL;
-static WGPUSurface webgpu_surface = NULL;
-static WGPUQueue   webgpu_queue   = NULL;
-#endif
+/* Required by renderercommon (tr_subs.c, tr_noise.c, tr_font.c, …) */
+qboolean textureFilterAnisotropic = qfalse;
+int      maxAnisotropy            = 0;
+float    displayAspect            = 1.0f;
+qboolean haveClampToEdge          = qtrue;
 
 /* =========================================================================
- * GLimp stubs
- *
- * The client expects these symbols whether or not they make sense for a
- * WebGPU renderer.  We provide minimal implementations so that the link
- * succeeds and window/input management still works through SDL.
+ * GLimp – platform / window interface
  * ========================================================================= */
 
 void GLimp_LogComment( char *comment )
 {
-	(void)comment;
+    (void)comment;
 }
 
 void GLimp_Minimize( void )
 {
 #ifdef __EMSCRIPTEN__
-	if ( webgpu_window )
-		SDL_MinimizeWindow( webgpu_window );
+    if ( wgpu.window )
+        SDL_MinimizeWindow( wgpu.window );
 #endif
 }
 
-void GLimp_Shutdown( void )
-{
-	ri.IN_Shutdown();
-
-#ifdef __EMSCRIPTEN__
-	if ( webgpu_surface )
-	{
-		wgpuSurfaceRelease( webgpu_surface );
-		webgpu_surface = NULL;
-	}
-	if ( webgpu_device )
-	{
-		wgpuDeviceRelease( webgpu_device );
-		webgpu_device = NULL;
-	}
-	if ( webgpu_window )
-	{
-		SDL_DestroyWindow( webgpu_window );
-		webgpu_window = NULL;
-	}
-	SDL_QuitSubSystem( SDL_INIT_VIDEO );
-#endif
-}
-
-/*
- * GLimp_Init -- create the SDL window and acquire a WebGPU device/surface.
- *
- * fixedFunction is ignored; WebGPU always uses programmable shaders.
- */
-void GLimp_Init( qboolean fixedFunction )
-{
-	(void)fixedFunction;
-
-#ifdef __EMSCRIPTEN__
-	cvar_t *r_mode         = ri.Cvar_Get( "r_mode",         "-2", CVAR_ARCHIVE | CVAR_LATCH );
-	cvar_t *r_fullscreen   = ri.Cvar_Get( "r_fullscreen",   "0",  CVAR_ARCHIVE | CVAR_LATCH );
-	cvar_t *r_width        = ri.Cvar_Get( "r_width",        "1280", CVAR_ARCHIVE | CVAR_LATCH );
-	cvar_t *r_height       = ri.Cvar_Get( "r_height",       "720",  CVAR_ARCHIVE | CVAR_LATCH );
-
-	int width  = r_width->integer  > 0 ? r_width->integer  : 1280;
-	int height = r_height->integer > 0 ? r_height->integer : 720;
-	(void)r_mode;
-	(void)r_fullscreen;
-
-	if ( SDL_Init( SDL_INIT_VIDEO ) < 0 )
-	{
-		ri.Error( ERR_FATAL, "GLimp_Init: SDL_Init failed: %s", SDL_GetError() );
-		return;
-	}
-
-	/* Create a plain SDL window (no OpenGL flag – WebGPU manages the surface). */
-	webgpu_window = SDL_CreateWindow(
-		CLIENT_WINDOW_TITLE,
-		SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-		width, height,
-		SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
-	);
-	if ( !webgpu_window )
-	{
-		ri.Error( ERR_FATAL, "GLimp_Init: SDL_CreateWindow failed: %s", SDL_GetError() );
-		return;
-	}
-
-	/* Acquire a WebGPU device through the Emscripten helper. */
-	webgpu_device = emscripten_webgpu_get_device();
-	if ( !webgpu_device )
-	{
-		ri.Error( ERR_FATAL, "GLimp_Init: emscripten_webgpu_get_device() returned NULL" );
-		return;
-	}
-
-	webgpu_queue = wgpuDeviceGetQueue( webgpu_device );
-
-	/* Create a surface that targets the HTML canvas element. */
-	WGPUSurfaceDescriptorFromCanvasHTMLSelector canvasDesc = {
-		.chain    = { .sType = WGPUSType_SurfaceDescriptorFromCanvasHTMLSelector },
-		.selector = "#canvas",
-	};
-	WGPUSurfaceDescriptor surfaceDesc = {
-		.nextInChain = &canvasDesc.chain,
-	};
-	WGPUInstance instance = wgpuCreateInstance( NULL );
-	webgpu_surface = wgpuInstanceCreateSurface( instance, &surfaceDesc );
-	wgpuInstanceRelease( instance );
-
-	if ( !webgpu_surface )
-	{
-		ri.Error( ERR_FATAL, "GLimp_Init: wgpuInstanceCreateSurface() failed" );
-		return;
-	}
-
-	/* Populate glConfig with sane defaults so the rest of the engine
-	   can read resolution / capability information. */
-	Com_Memset( &glConfig, 0, sizeof( glConfig ) );
-	Q_strncpyz( glConfig.renderer_string,  "WebGPU",   sizeof( glConfig.renderer_string ) );
-	Q_strncpyz( glConfig.vendor_string,    "Browser",  sizeof( glConfig.vendor_string ) );
-	Q_strncpyz( glConfig.version_string,   "1.0",      sizeof( glConfig.version_string ) );
-	glConfig.vidWidth            = width;
-	glConfig.vidHeight           = height;
-	glConfig.windowAspect        = (float)width / (float)height;
-	glConfig.colorBits           = 32;
-	glConfig.depthBits           = 24;
-	glConfig.stencilBits         = 8;
-	glConfig.maxTextureSize      = 8192;
-	glConfig.numTextureUnits     = 16;
-	glConfig.driverType          = GLDRV_ICD;
-	glConfig.hardwareType        = GLHW_GENERIC;
-	glConfig.deviceSupportsGamma = qfalse;
-	glConfig.textureCompression  = TC_NONE;
-
-	/* Hand the SDL window to the input subsystem. */
-	ri.IN_Init( webgpu_window );
-
-	ri.Printf( PRINT_ALL, "WebGPU renderer initialised (%dx%d)\n", width, height );
-#else
-	ri.Error( ERR_FATAL, "WebGPU renderer is only supported on Emscripten" );
-#endif
-}
-
-/* Present the current frame.  With WebGPU this happens via wgpuQueueSubmit /
-   wgpuSurfacePresent; for now it is a no-op stub until draw commands are
-   generated. */
-void GLimp_EndFrame( void )
-{
-	/* TODO: wgpuSurfacePresent( webgpu_surface ); */
-}
-
-/* Called after GLimp_Init to load any extra extensions.  WebGPU has no
-   extension string mechanism; nothing to do here. */
 void GLimp_InitExtraExtensions( void )
 {
+    /* WebGPU has no extension string mechanism */
+}
+
+/* -------------------------------------------------------------------------
+ * GLimp_Shutdown – release WebGPU resources and destroy the SDL window.
+ * ---------------------------------------------------------------------- */
+void GLimp_Shutdown( void )
+{
+    ri.IN_Shutdown();
+
+#ifdef __EMSCRIPTEN__
+    WR_FreeImages();
+
+    if ( wgpu.verts2D )
+    {
+        ri.Free( wgpu.verts2D );
+        wgpu.verts2D = NULL;
+    }
+
+    if ( wgpu.vb2D )
+    {
+        wgpuBufferDestroy( wgpu.vb2D );
+        wgpuBufferRelease( wgpu.vb2D );
+        wgpu.vb2D = NULL;
+    }
+    if ( wgpu.ub2D )
+    {
+        wgpuBufferDestroy( wgpu.ub2D );
+        wgpuBufferRelease( wgpu.ub2D );
+        wgpu.ub2D = NULL;
+    }
+
+    if ( wgpu.depthView )
+    {
+        wgpuTextureViewRelease( wgpu.depthView );
+        wgpu.depthView = NULL;
+    }
+    if ( wgpu.depthTex )
+    {
+        wgpuTextureDestroy( wgpu.depthTex );
+        wgpuTextureRelease( wgpu.depthTex );
+        wgpu.depthTex = NULL;
+    }
+
+    if ( wgpu.shaderMod2D )
+    {
+        wgpuShaderModuleRelease( wgpu.shaderMod2D );
+        wgpu.shaderMod2D = NULL;
+    }
+    if ( wgpu.shaderMod3D )
+    {
+        wgpuShaderModuleRelease( wgpu.shaderMod3D );
+        wgpu.shaderMod3D = NULL;
+    }
+
+    if ( wgpu.swapChain )
+    {
+        wgpuSwapChainRelease( wgpu.swapChain );
+        wgpu.swapChain = NULL;
+    }
+    if ( wgpu.surface )
+    {
+        wgpuSurfaceRelease( wgpu.surface );
+        wgpu.surface = NULL;
+    }
+    if ( wgpu.queue )
+    {
+        wgpuQueueRelease( wgpu.queue );
+        wgpu.queue = NULL;
+    }
+    if ( wgpu.device )
+    {
+        wgpuDeviceRelease( wgpu.device );
+        wgpu.device = NULL;
+    }
+    if ( wgpu.window )
+    {
+        SDL_DestroyWindow( wgpu.window );
+        wgpu.window = NULL;
+        SDL_QuitSubSystem( SDL_INIT_VIDEO );
+    }
+#endif
+
+    wgpu.initialized = qfalse;
+}
+
+/* -------------------------------------------------------------------------
+ * GLimp_EndFrame – present the rendered frame.
+ * (Called from RE_EndFrame → WR_EndFrame, so this is a no-op here.)
+ * ---------------------------------------------------------------------- */
+void GLimp_EndFrame( void )
+{
+    /* Presentation is handled by WR_EndFrame. */
+}
+
+/* -------------------------------------------------------------------------
+ * GLimp_Init – create SDL window, acquire WebGPU device/surface/swapchain,
+ * upload all GPU resources needed for the 2D pass.
+ * ---------------------------------------------------------------------- */
+void GLimp_Init( qboolean fixedFunction )
+{
+    (void)fixedFunction;
+
+#ifdef __EMSCRIPTEN__
+    cvar_t *r_width  = ri.Cvar_Get( "r_width",  "1280", CVAR_ARCHIVE | CVAR_LATCH );
+    cvar_t *r_height = ri.Cvar_Get( "r_height", "720",  CVAR_ARCHIVE | CVAR_LATCH );
+
+    int width  = ( r_width->integer  > 0 ) ? r_width->integer  : 1280;
+    int height = ( r_height->integer > 0 ) ? r_height->integer : 720;
+
+    /* ------------------------------------------------------------------ */
+    if ( SDL_Init( SDL_INIT_VIDEO ) < 0 )
+        ri.Error( ERR_FATAL, "GLimp_Init: SDL_Init failed: %s", SDL_GetError() );
+
+    wgpu.window = SDL_CreateWindow(
+        CLIENT_WINDOW_TITLE,
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        width, height,
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
+    );
+    if ( !wgpu.window )
+        ri.Error( ERR_FATAL, "GLimp_Init: SDL_CreateWindow failed: %s", SDL_GetError() );
+
+    wgpu.vidWidth  = width;
+    wgpu.vidHeight = height;
+
+    /* ---- Acquire WebGPU device ---------------------------------------- */
+    wgpu.device = emscripten_webgpu_get_device();
+    if ( !wgpu.device )
+        ri.Error( ERR_FATAL, "GLimp_Init: emscripten_webgpu_get_device() returned NULL" );
+
+    wgpu.queue = wgpuDeviceGetQueue( wgpu.device );
+
+    /* ---- Create surface targeting the HTML canvas ---------------------- */
+    {
+        WGPUSurfaceDescriptorFromCanvasHTMLSelector canvasDesc;
+        WGPUSurfaceDescriptor                       surfDesc;
+        WGPUInstance                                instance;
+
+        Com_Memset( &canvasDesc, 0, sizeof( canvasDesc ) );
+        canvasDesc.chain.sType = WGPUSType_SurfaceDescriptorFromCanvasHTMLSelector;
+        canvasDesc.selector    = "#canvas";
+
+        Com_Memset( &surfDesc, 0, sizeof( surfDesc ) );
+        surfDesc.nextInChain = &canvasDesc.chain;
+
+        instance      = wgpuCreateInstance( NULL );
+        wgpu.surface  = wgpuInstanceCreateSurface( instance, &surfDesc );
+        wgpuInstanceRelease( instance );
+
+        if ( !wgpu.surface )
+            ri.Error( ERR_FATAL, "GLimp_Init: wgpuInstanceCreateSurface() failed" );
+    }
+
+    /* ---- Create swap chain --------------------------------------------- */
+    {
+        WGPUSwapChainDescriptor scDesc;
+        Com_Memset( &scDesc, 0, sizeof( scDesc ) );
+        scDesc.usage       = WGPUTextureUsage_RenderAttachment;
+        scDesc.format      = WGPUTextureFormat_BGRA8Unorm;
+        scDesc.width       = (uint32_t)width;
+        scDesc.height      = (uint32_t)height;
+        scDesc.presentMode = WGPUPresentMode_Fifo;
+        scDesc.label       = "Main swap chain";
+
+        wgpu.swapChain = wgpuDeviceCreateSwapChain( wgpu.device, wgpu.surface, &scDesc );
+        if ( !wgpu.swapChain )
+            ri.Error( ERR_FATAL, "GLimp_Init: wgpuDeviceCreateSwapChain() failed" );
+    }
+
+    /* ---- Depth texture ------------------------------------------------- */
+    {
+        WGPUTextureDescriptor     tdesc;
+        WGPUTextureViewDescriptor vdesc;
+
+        Com_Memset( &tdesc, 0, sizeof( tdesc ) );
+        tdesc.usage               = WGPUTextureUsage_RenderAttachment;
+        tdesc.dimension           = WGPUTextureDimension_2D;
+        tdesc.size.width          = (uint32_t)width;
+        tdesc.size.height         = (uint32_t)height;
+        tdesc.size.depthOrArrayLayers = 1;
+        tdesc.format              = WGPUTextureFormat_Depth24PlusStencil8;
+        tdesc.mipLevelCount       = 1;
+        tdesc.sampleCount         = 1;
+        tdesc.label               = "Depth/stencil";
+
+        wgpu.depthTex = wgpuDeviceCreateTexture( wgpu.device, &tdesc );
+
+        Com_Memset( &vdesc, 0, sizeof( vdesc ) );
+        vdesc.format          = WGPUTextureFormat_Depth24PlusStencil8;
+        vdesc.dimension       = WGPUTextureViewDimension_2D;
+        vdesc.baseMipLevel    = 0;
+        vdesc.mipLevelCount   = 1;
+        vdesc.baseArrayLayer  = 0;
+        vdesc.arrayLayerCount = 1;
+        vdesc.aspect          = WGPUTextureAspect_All;
+        vdesc.label           = "Depth view";
+
+        wgpu.depthView = wgpuTextureCreateView( wgpu.depthTex, &vdesc );
+    }
+
+    /* ---- 2D vertex buffer (write-mapped each frame) ------------------- */
+    {
+        WGPUBufferDescriptor bdesc;
+        Com_Memset( &bdesc, 0, sizeof( bdesc ) );
+        bdesc.usage            = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+        bdesc.size             = WGPU_2D_VB_SIZE;
+        bdesc.mappedAtCreation = 0;
+        bdesc.label            = "2D vertex buffer";
+        wgpu.vb2D = wgpuDeviceCreateBuffer( wgpu.device, &bdesc );
+    }
+
+    /* ---- 2D uniform buffer -------------------------------------------- */
+    {
+        WGPUBufferDescriptor bdesc;
+        Com_Memset( &bdesc, 0, sizeof( bdesc ) );
+        bdesc.usage            = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+        bdesc.size             = WGPU_UNIFORM_BUF_SIZE;
+        bdesc.mappedAtCreation = 0;
+        bdesc.label            = "2D uniform buffer";
+        wgpu.ub2D = wgpuDeviceCreateBuffer( wgpu.device, &bdesc );
+    }
+
+    /* ---- CPU-side staging for 2D vertices ----------------------------- */
+    wgpu.verts2D = (wgpuVert2D_t *)ri.Malloc( MAX_2D_VERTS * sizeof( wgpuVert2D_t ) );
+    if ( !wgpu.verts2D )
+        ri.Error( ERR_FATAL, "GLimp_Init: failed to allocate 2D vertex staging buffer" );
+
+    /* ---- WGSL shader modules + pipelines ------------------------------ */
+    WR_InitShaderModules();
+    WR_InitPipelines();
+
+    /* ---- Image + material system --------------------------------------- */
+    WR_InitImages();
+    WR_InitShaders();
+
+    /* ---- Populate glConfig -------------------------------------------- */
+    Com_Memset( &glConfig, 0, sizeof( glConfig ) );
+    Q_strncpyz( glConfig.renderer_string, "WebGPU",   sizeof( glConfig.renderer_string ) );
+    Q_strncpyz( glConfig.vendor_string,   "Browser",  sizeof( glConfig.vendor_string   ) );
+    Q_strncpyz( glConfig.version_string,  "1.0",      sizeof( glConfig.version_string  ) );
+    glConfig.vidWidth            = width;
+    glConfig.vidHeight           = height;
+    glConfig.windowAspect        = (float)width / (float)height;
+    glConfig.colorBits           = 32;
+    glConfig.depthBits           = 24;
+    glConfig.stencilBits         = 8;
+    glConfig.maxTextureSize      = 8192;
+    glConfig.numTextureUnits     = 16;
+    glConfig.driverType          = GLDRV_ICD;
+    glConfig.hardwareType        = GLHW_GENERIC;
+    glConfig.deviceSupportsGamma = qfalse;
+    glConfig.textureCompression  = TC_NONE;
+
+    /* ---- Default 2D colour -------------------------------------------- */
+    wgpu.color2D[0] = wgpu.color2D[1] = wgpu.color2D[2] = wgpu.color2D[3] = 1.0f;
+
+    /* ---- Input system ------------------------------------------------- */
+    ri.IN_Init( wgpu.window );
+
+    wgpu.initialized = qtrue;
+    ri.Printf( PRINT_ALL, "WebGPU renderer initialised (%dx%d)\n", width, height );
+
+#else
+    ri.Error( ERR_FATAL, "WebGPU renderer requires Emscripten" );
+#endif
 }
 
 /* =========================================================================
- * Renderer interface (refexport_t) stubs
- *
- * Every function pointer in refexport_t must be non-NULL; we provide minimal
- * implementations here.  Functions that the engine needs actual output from
- * (BeginRegistration, LerpTag, …) return safe zero / default values.
+ * refexport_t implementations
  * ========================================================================= */
 
 static void RE_Shutdown( qboolean destroyWindow )
 {
-	ri.Printf( PRINT_ALL, "RE_Shutdown( %i )\n", destroyWindow );
-	if ( destroyWindow )
-		GLimp_Shutdown();
+    ri.Printf( PRINT_ALL, "RE_Shutdown( %i )\n", destroyWindow );
+    if ( destroyWindow )
+        GLimp_Shutdown();
 }
 
 static void RE_BeginRegistration( glconfig_t *config )
 {
-	GLimp_Init( qfalse );
-	*config = glConfig;
+    GLimp_Init( qfalse );
+    *config = glConfig;
 }
 
 static void RE_GetGlConfig( glconfig_t *config )
 {
-	*config = glConfig;
+    *config = glConfig;
 }
 
-static qhandle_t RE_RegisterModel( const char *name )         { (void)name; return 0; }
-static void      R_GetModelName( qhandle_t index, char *name, int sz )
-                                                               { (void)index; if(sz>0) name[0]='\0'; }
-static qhandle_t RE_RegisterSkin( const char *name )          { (void)name; return 0; }
-static qhandle_t RE_RegisterShader( const char *name )        { (void)name; return 0; }
-static qhandle_t RE_RegisterShaderNoMip( const char *name )   { (void)name; return 0; }
-static qhandle_t RE_RegisterShaderLightMap( const char *name, int lightmap )
-                                                               { (void)name; (void)lightmap; return 0; }
-static void      RE_LoadWorldMap( const char *name )           { (void)name; }
-static void      RE_SetWorldVisData( const byte *vis )         { (void)vis; }
-static void      RE_EndRegistration( void )                    {}
-
-static void      RE_BeginFrame( stereoFrame_t stereoFrame, qboolean recordingVideo )
-                                                               { (void)stereoFrame; (void)recordingVideo; }
-static void      RE_EndFrame( int *frontEndMsec, int *backEndMsec )
+static qhandle_t RE_RegisterModel( const char *name )
 {
-	if ( frontEndMsec ) *frontEndMsec = 0;
-	if ( backEndMsec )  *backEndMsec  = 0;
-	GLimp_EndFrame();
+    (void)name;
+    return 0;
 }
 
-static int  R_MarkFragments( int numPoints, const vec3_t *points, const vec3_t projection,
-                              int maxPoints, vec3_t pointBuffer, int maxFragments,
+static void R_GetModelName( qhandle_t index, char *name, int sz )
+{
+    (void)index;
+    if ( sz > 0 ) name[0] = '\0';
+}
+
+static qhandle_t RE_RegisterSkin( const char *name )
+{
+    (void)name;
+    return 0;
+}
+
+static qhandle_t RE_RegisterShader( const char *name )
+{
+    if ( !wgpu.initialized ) return 0;
+    return (qhandle_t)WR_RegisterShader( name, WGPU_MAT_BLEND );
+}
+
+static qhandle_t RE_RegisterShaderNoMip( const char *name )
+{
+    if ( !wgpu.initialized ) return 0;
+    return (qhandle_t)WR_RegisterShader( name, WGPU_MAT_BLEND );
+}
+
+static qhandle_t RE_RegisterShaderLightMap( const char *name, int lightmap )
+{
+    (void)lightmap;
+    if ( !wgpu.initialized ) return 0;
+    return (qhandle_t)WR_RegisterShader( name, 0 );
+}
+
+static void RE_LoadWorldMap( const char *name )       { (void)name; }
+static void RE_SetWorldVisData( const byte *vis )     { (void)vis;  }
+static void RE_EndRegistration( void )                {}
+
+static void RE_BeginFrame( stereoFrame_t stereoFrame, qboolean recordingVideo )
+{
+    (void)stereoFrame;
+    (void)recordingVideo;
+    WR_BeginFrame();
+}
+
+static void RE_EndFrame( int *frontEndMsec, int *backEndMsec )
+{
+    if ( frontEndMsec ) *frontEndMsec = 0;
+    if ( backEndMsec  ) *backEndMsec  = 0;
+    WR_EndFrame();
+}
+
+static int R_MarkFragments( int numPoints, const vec3_t *points,
+                              const vec3_t projection, int maxPoints,
+                              vec3_t pointBuffer, int maxFragments,
                               markFragment_t *fragmentBuffer )
 {
-	(void)numPoints; (void)points; (void)projection;
-	(void)maxPoints; (void)pointBuffer; (void)maxFragments; (void)fragmentBuffer;
-	return 0;
+    (void)numPoints; (void)points; (void)projection;
+    (void)maxPoints; (void)pointBuffer; (void)maxFragments; (void)fragmentBuffer;
+    return 0;
 }
 
-static int  R_LerpTag( orientation_t *tag, qhandle_t model, int startFrame, int endFrame,
-                        float frac, const char *tagName )
+static int R_LerpTag( orientation_t *tag, qhandle_t model,
+                       int startFrame, int endFrame,
+                       float frac, const char *tagName )
 {
-	(void)model; (void)startFrame; (void)endFrame; (void)frac; (void)tagName;
-	Com_Memset( tag, 0, sizeof( *tag ) );
-	return 0;
+    (void)model; (void)startFrame; (void)endFrame; (void)frac; (void)tagName;
+    Com_Memset( tag, 0, sizeof( *tag ) );
+    return 0;
 }
 
 static void R_ModelBounds( qhandle_t model, vec3_t mins, vec3_t maxs )
 {
-	(void)model;
-	VectorClear( mins );
-	VectorClear( maxs );
+    (void)model;
+    VectorClear( mins );
+    VectorClear( maxs );
 }
 
 static void RE_ClearScene( void )                              {}
@@ -289,104 +442,229 @@ static void RE_SetPathLines( int *numCameraPoints, cameraPoint_t *cameraPoints,
                               int *numSplinePoints, vec3_t *splinePoints,
                               const vec4_t color )
 {
-	(void)numCameraPoints; (void)cameraPoints;
-	(void)numSplinePoints; (void)splinePoints; (void)color;
+    (void)numCameraPoints; (void)cameraPoints;
+    (void)numSplinePoints; (void)splinePoints; (void)color;
 }
-static void RE_AddPolyToScene( qhandle_t hShader, int numVerts, const polyVert_t *verts,
-                                int num, int lightmap )
+static void RE_AddPolyToScene( qhandle_t hShader, int numVerts,
+                                const polyVert_t *verts, int num, int lightmap )
 {
-	(void)hShader; (void)numVerts; (void)verts; (void)num; (void)lightmap;
+    (void)hShader; (void)numVerts; (void)verts; (void)num; (void)lightmap;
 }
-static int  R_LightForPoint( const vec3_t point, vec3_t ambientLight,
-                               vec3_t directedLight, vec3_t lightDir )
+static int R_LightForPoint( const vec3_t point, vec3_t ambientLight,
+                              vec3_t directedLight, vec3_t lightDir )
 {
-	(void)point;
-	VectorClear( ambientLight );
-	VectorClear( directedLight );
-	VectorClear( lightDir );
-	return 0;
+    (void)point;
+    VectorClear( ambientLight );
+    VectorClear( directedLight );
+    VectorClear( lightDir );
+    return 0;
 }
-static void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, float b )
-                                                               { (void)org; (void)intensity; (void)r; (void)g; (void)b; }
-static void RE_AddAdditiveLightToScene( const vec3_t org, float intensity, float r, float g, float b )
-                                                               { (void)org; (void)intensity; (void)r; (void)g; (void)b; }
+static void RE_AddLightToScene( const vec3_t org, float intensity,
+                                 float r, float g, float b )
+{
+    (void)org; (void)intensity; (void)r; (void)g; (void)b;
+}
+static void RE_AddAdditiveLightToScene( const vec3_t org, float intensity,
+                                         float r, float g, float b )
+{
+    (void)org; (void)intensity; (void)r; (void)g; (void)b;
+}
 static void RE_RenderScene( const refdef_t *fd )               { (void)fd; }
 
-static void RE_SetColor( const float *rgba )                   { (void)rgba; }
+static void RE_SetColor( const float *rgba )
+{
+    if ( rgba )
+    {
+        wgpu.color2D[0] = rgba[0];
+        wgpu.color2D[1] = rgba[1];
+        wgpu.color2D[2] = rgba[2];
+        wgpu.color2D[3] = rgba[3];
+    }
+    else
+    {
+        wgpu.color2D[0] = wgpu.color2D[1] = wgpu.color2D[2] = wgpu.color2D[3] = 1.0f;
+    }
+}
+
 static void RE_StretchPic( float x, float y, float w, float h,
                             float s1, float t1, float s2, float t2,
                             qhandle_t hShader )
 {
-	(void)x; (void)y; (void)w; (void)h;
-	(void)s1; (void)t1; (void)s2; (void)t2; (void)hShader;
+    WR_AddStretchPic( x, y, w, h, s1, t1, s2, t2, (int)hShader );
 }
+
 static void RE_StretchRaw( int x, int y, int w, int h, int cols, int rows,
                             const byte *data, int client, qboolean dirty )
 {
-	(void)x; (void)y; (void)w; (void)h; (void)cols; (void)rows;
-	(void)data; (void)client; (void)dirty;
+    /* Upload raw RGBA data as a scratch texture and draw it */
+    char   scratchName[32];
+    int    matIdx;
+    int    imgIdx;
+    byte  *rgba;
+    int    i, j;
+
+    (void)client; (void)dirty;
+
+    if ( !wgpu.initialized || !data || cols <= 0 || rows <= 0 )
+        return;
+
+    /* Q3 cinematic data arrives as RGB rows; convert to RGBA */
+    rgba = (byte *)ri.Hunk_AllocateTempMemory( cols * rows * 4 );
+    if ( !rgba )
+        return;
+
+    for ( i = 0; i < rows; i++ )
+    {
+        for ( j = 0; j < cols; j++ )
+        {
+            const byte *src = data + ( i * cols + j ) * 4;
+            byte       *dst = rgba  + ( i * cols + j ) * 4;
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+            dst[3] = 255;
+        }
+    }
+
+    Com_sprintf( scratchName, sizeof( scratchName ), "_scratch_%d", client );
+    imgIdx = WR_CreateImageFromData( scratchName, rgba, cols, rows, qfalse, qtrue );
+    ri.Hunk_FreeTempMemory( rgba );
+
+    matIdx = WR_RegisterShaderFromData( scratchName, NULL, 0, 0, qfalse, qtrue );
+    /* Update the material's imageIndex directly */
+    if ( matIdx > 0 && matIdx < wgpu.numMats )
+        wgpu.mats[matIdx].imageIndex = imgIdx;
+
+    WR_AddStretchPic( (float)x, (float)y, (float)w, (float)h,
+                       0.0f, 0.0f, 1.0f, 1.0f, matIdx );
 }
+
 static void RE_UploadCinematic( int w, int h, int cols, int rows,
                                  const byte *data, int client, qboolean dirty )
 {
-	(void)w; (void)h; (void)cols; (void)rows; (void)data; (void)client; (void)dirty;
+    (void)w; (void)h;
+    RE_StretchRaw( 0, 0, cols, rows, cols, rows, data, client, dirty );
 }
 
-static void     RE_RegisterFont( const char *fontName, int pointSize, fontInfo_t *font )
-                                                               { (void)fontName; (void)pointSize; Com_Memset( font, 0, sizeof(*font) ); }
+static void RE_RegisterFont( const char *fontName, int pointSize, fontInfo_t *font )
+{
+    (void)fontName; (void)pointSize;
+    Com_Memset( font, 0, sizeof( *font ) );
+}
+
 static qboolean RE_GetGlyphInfo( fontInfo_t *fontInfo, int charValue, glyphInfo_t *glyphOut )
-                                                               { (void)fontInfo; (void)charValue; Com_Memset( glyphOut, 0, sizeof(*glyphOut) ); return qfalse; }
-static qboolean RE_GetFontInfo( int fontId, fontInfo_t *font )
-                                                               { (void)fontId; Com_Memset( font, 0, sizeof(*font) ); return qfalse; }
-
-static void     R_RemapShader( const char *oldShader, const char *newShader,
-                                const char *offsetTime, qboolean keepLightmap,
-                                qboolean userSet )
 {
-	(void)oldShader; (void)newShader; (void)offsetTime;
-	(void)keepLightmap; (void)userSet;
+    (void)fontInfo; (void)charValue;
+    Com_Memset( glyphOut, 0, sizeof( *glyphOut ) );
+    return qfalse;
 }
-static void     R_ClearRemappedShader( const char *shaderName )
-                                                               { (void)shaderName; }
-static qboolean R_GetEntityToken( char *buffer, int size )
-                                                               { if(size>0) buffer[0]='\0'; return qfalse; }
-static qboolean R_inPVS( const vec3_t p1, const vec3_t p2 )   { (void)p1; (void)p2; return qtrue; }
 
-static void     RE_TakeVideoFrame( aviFileData_t *afd, int h, int w,
-                                    byte *captureBuffer, byte *encodeBuffer,
-                                    qboolean motionJpeg, qboolean avi,
-                                    qboolean tga, qboolean jpg, qboolean png,
-                                    int picCount, char *givenFileName )
+static qboolean RE_GetFontInfo( int fontId, fontInfo_t *font )
 {
-	(void)afd; (void)h; (void)w; (void)captureBuffer; (void)encodeBuffer;
-	(void)motionJpeg; (void)avi; (void)tga; (void)jpg; (void)png;
-	(void)picCount; (void)givenFileName;
+    (void)fontId;
+    Com_Memset( font, 0, sizeof( *font ) );
+    return qfalse;
+}
+
+static void R_RemapShader( const char *oldShader, const char *newShader,
+                            const char *offsetTime, qboolean keepLightmap,
+                            qboolean userSet )
+{
+    (void)oldShader; (void)newShader; (void)offsetTime;
+    (void)keepLightmap; (void)userSet;
+}
+
+static void     R_ClearRemappedShader( const char *shaderName ) { (void)shaderName; }
+static qboolean R_GetEntityToken( char *buffer, int size )
+{
+    if ( size > 0 ) buffer[0] = '\0';
+    return qfalse;
+}
+static qboolean R_inPVS( const vec3_t p1, const vec3_t p2 )    { (void)p1; (void)p2; return qtrue; }
+
+static void RE_TakeVideoFrame( aviFileData_t *afd, int h, int w,
+                                byte *captureBuffer, byte *encodeBuffer,
+                                qboolean motionJpeg, qboolean avi,
+                                qboolean tga, qboolean jpg, qboolean png,
+                                int picCount, char *givenFileName )
+{
+    (void)afd; (void)h; (void)w; (void)captureBuffer; (void)encodeBuffer;
+    (void)motionJpeg; (void)avi; (void)tga; (void)jpg; (void)png;
+    (void)picCount; (void)givenFileName;
 }
 
 static void     RE_BeginHud( void )                            {}
 static void     RE_UpdateDof( float viewFocus, float viewRadius )
                                                                { (void)viewFocus; (void)viewRadius; }
 
-static void     RE_Get_Advertisements( int *num, float *verts, char shaders[][MAX_QPATH] )
-                                                               { (void)verts; (void)shaders; if(num) *num = 0; }
-static void     RE_ReplaceShaderImage( qhandle_t h, const ubyte *data, int width, int height )
-                                                               { (void)h; (void)data; (void)width; (void)height; }
-static qhandle_t RE_RegisterShaderFromData( const char *name, ubyte *data, int width, int height,
+static void RE_Get_Advertisements( int *num, float *verts, char shaders[][MAX_QPATH] )
+{
+    (void)verts; (void)shaders;
+    if ( num ) *num = 0;
+}
+
+static void RE_ReplaceShaderImage( qhandle_t h, const ubyte *data, int width, int height )
+{
+    int      matIdx = (int)h;
+    int      imgIdx;
+    wgpuMat_t *mat;
+    char      name[MAX_QPATH];
+
+    if ( !wgpu.initialized || !data || width <= 0 || height <= 0 )
+        return;
+
+    if ( matIdx < 0 || matIdx >= wgpu.numMats )
+        return;
+
+    mat = &wgpu.mats[matIdx];
+    /* Re-create the image (same name = reuse slot) */
+    imgIdx = WR_CreateImageFromData( mat->name, data, width, height,
+                                      qfalse, qtrue );
+    mat->imageIndex = imgIdx;
+}
+
+static qhandle_t RE_RegisterShaderFromData( const char *name, ubyte *data,
+                                             int width, int height,
                                              qboolean mipmap, qboolean allowPicmip,
                                              int wrapClampMode, int lightmapIndex )
 {
-	(void)name; (void)data; (void)width; (void)height;
-	(void)mipmap; (void)allowPicmip; (void)wrapClampMode; (void)lightmapIndex;
-	return 0;
+    (void)allowPicmip; (void)lightmapIndex;
+    if ( !wgpu.initialized ) return 0;
+    return (qhandle_t)WR_RegisterShaderFromData(
+        name, data, width, height,
+        mipmap, ( wrapClampMode != 0 ) );
 }
-static void     RE_GetShaderImageDimensions( qhandle_t h, int *width, int *height )
-                                                               { (void)h; if(width)*width=0; if(height)*height=0; }
-static void     RE_GetShaderImageData( qhandle_t h, ubyte *data )
-                                                               { (void)h; (void)data; }
-static qhandle_t RE_GetSingleShader( void )                    { return 0; }
+
+static void RE_GetShaderImageDimensions( qhandle_t h, int *width, int *height )
+{
+    int matIdx = (int)h;
+    if ( matIdx >= 0 && matIdx < wgpu.numMats )
+    {
+        int imgIdx = wgpu.mats[matIdx].imageIndex;
+        if ( imgIdx >= 0 && imgIdx < wgpu.numImages )
+        {
+            if ( width  ) *width  = wgpu.images[imgIdx].width;
+            if ( height ) *height = wgpu.images[imgIdx].height;
+            return;
+        }
+    }
+    if ( width  ) *width  = 0;
+    if ( height ) *height = 0;
+}
+
+static void RE_GetShaderImageData( qhandle_t h, ubyte *data )
+{
+    /* Cannot readback GPU textures efficiently; leave blank */
+    (void)h; (void)data;
+}
+
+static qhandle_t RE_GetSingleShader( void )
+{
+    return 0;
+}
 
 /* =========================================================================
- * GetRefAPI -- the single exported symbol
+ * GetRefAPI – the single exported symbol
  * ========================================================================= */
 
 #ifdef USE_RENDERER_DLOPEN
@@ -396,76 +674,76 @@ Q_EXPORT refexport_t * QDECL GetRefAPI( int apiVersion, refimport_t *rimp )
 refexport_t *GetRefAPI( int apiVersion, refimport_t *rimp )
 {
 #endif
-	static refexport_t re;
+    static refexport_t re;
 
-	ri = *rimp;
+    ri = *rimp;
 
-	Com_Memset( &re, 0, sizeof( re ) );
+    Com_Memset( &re, 0, sizeof( re ) );
 
-	if ( apiVersion != REF_API_VERSION )
-	{
-		ri.Printf( PRINT_ALL,
-		           "Mismatched REF_API_VERSION: expected %i, got %i\n",
-		           REF_API_VERSION, apiVersion );
-		return NULL;
-	}
+    if ( apiVersion != REF_API_VERSION )
+    {
+        ri.Printf( PRINT_ALL,
+                   "Mismatched REF_API_VERSION: expected %i, got %i\n",
+                   REF_API_VERSION, apiVersion );
+        return NULL;
+    }
 
-	re.Shutdown               = RE_Shutdown;
-	re.BeginRegistration      = RE_BeginRegistration;
-	re.GetGlConfig            = RE_GetGlConfig;
-	re.RegisterModel          = RE_RegisterModel;
-	re.GetModelName           = R_GetModelName;
-	re.RegisterSkin           = RE_RegisterSkin;
-	re.RegisterShader         = RE_RegisterShader;
-	re.RegisterShaderLightMap = RE_RegisterShaderLightMap;
-	re.RegisterShaderNoMip    = RE_RegisterShaderNoMip;
-	re.LoadWorld              = RE_LoadWorldMap;
-	re.SetWorldVisData        = RE_SetWorldVisData;
-	re.EndRegistration        = RE_EndRegistration;
+    re.Shutdown               = RE_Shutdown;
+    re.BeginRegistration      = RE_BeginRegistration;
+    re.GetGlConfig            = RE_GetGlConfig;
+    re.RegisterModel          = RE_RegisterModel;
+    re.GetModelName           = R_GetModelName;
+    re.RegisterSkin           = RE_RegisterSkin;
+    re.RegisterShader         = RE_RegisterShader;
+    re.RegisterShaderLightMap = RE_RegisterShaderLightMap;
+    re.RegisterShaderNoMip    = RE_RegisterShaderNoMip;
+    re.LoadWorld              = RE_LoadWorldMap;
+    re.SetWorldVisData        = RE_SetWorldVisData;
+    re.EndRegistration        = RE_EndRegistration;
 
-	re.BeginFrame             = RE_BeginFrame;
-	re.EndFrame               = RE_EndFrame;
+    re.BeginFrame             = RE_BeginFrame;
+    re.EndFrame               = RE_EndFrame;
 
-	re.MarkFragments          = R_MarkFragments;
-	re.LerpTag                = R_LerpTag;
-	re.ModelBounds            = R_ModelBounds;
+    re.MarkFragments          = R_MarkFragments;
+    re.LerpTag                = R_LerpTag;
+    re.ModelBounds            = R_ModelBounds;
 
-	re.ClearScene             = RE_ClearScene;
-	re.AddRefEntityToScene    = RE_AddRefEntityToScene;
-	re.AddRefEntityPtrToScene = RE_AddRefEntityPtrToScene;
-	re.SetPathLines           = RE_SetPathLines;
-	re.AddPolyToScene         = RE_AddPolyToScene;
-	re.LightForPoint          = R_LightForPoint;
-	re.AddLightToScene        = RE_AddLightToScene;
-	re.AddAdditiveLightToScene= RE_AddAdditiveLightToScene;
-	re.RenderScene            = RE_RenderScene;
+    re.ClearScene             = RE_ClearScene;
+    re.AddRefEntityToScene    = RE_AddRefEntityToScene;
+    re.AddRefEntityPtrToScene = RE_AddRefEntityPtrToScene;
+    re.SetPathLines           = RE_SetPathLines;
+    re.AddPolyToScene         = RE_AddPolyToScene;
+    re.LightForPoint          = R_LightForPoint;
+    re.AddLightToScene        = RE_AddLightToScene;
+    re.AddAdditiveLightToScene= RE_AddAdditiveLightToScene;
+    re.RenderScene            = RE_RenderScene;
 
-	re.SetColor               = RE_SetColor;
-	re.DrawStretchPic         = RE_StretchPic;
-	re.DrawStretchRaw         = RE_StretchRaw;
-	re.UploadCinematic        = RE_UploadCinematic;
+    re.SetColor               = RE_SetColor;
+    re.DrawStretchPic         = RE_StretchPic;
+    re.DrawStretchRaw         = RE_StretchRaw;
+    re.UploadCinematic        = RE_UploadCinematic;
 
-	re.RegisterFont           = RE_RegisterFont;
-	re.GetGlyphInfo           = RE_GetGlyphInfo;
-	re.GetFontInfo            = RE_GetFontInfo;
-	re.RemapShader            = R_RemapShader;
-	re.ClearRemappedShader    = R_ClearRemappedShader;
-	re.GetEntityToken         = R_GetEntityToken;
-	re.inPVS                  = R_inPVS;
+    re.RegisterFont           = RE_RegisterFont;
+    re.GetGlyphInfo           = RE_GetGlyphInfo;
+    re.GetFontInfo            = RE_GetFontInfo;
+    re.RemapShader            = R_RemapShader;
+    re.ClearRemappedShader    = R_ClearRemappedShader;
+    re.GetEntityToken         = R_GetEntityToken;
+    re.inPVS                  = R_inPVS;
 
-	re.TakeVideoFrame         = RE_TakeVideoFrame;
+    re.TakeVideoFrame         = RE_TakeVideoFrame;
 
-	re.BeginHud               = RE_BeginHud;
-	re.UpdateDof              = RE_UpdateDof;
+    re.BeginHud               = RE_BeginHud;
+    re.UpdateDof              = RE_UpdateDof;
 
-	re.Get_Advertisements     = RE_Get_Advertisements;
-	re.ReplaceShaderImage     = RE_ReplaceShaderImage;
-	re.RegisterShaderFromData = RE_RegisterShaderFromData;
-	re.GetShaderImageDimensions = RE_GetShaderImageDimensions;
-	re.GetShaderImageData     = RE_GetShaderImageData;
-	re.GetSingleShader        = RE_GetSingleShader;
+    re.Get_Advertisements     = RE_Get_Advertisements;
+    re.ReplaceShaderImage     = RE_ReplaceShaderImage;
+    re.RegisterShaderFromData = RE_RegisterShaderFromData;
+    re.GetShaderImageDimensions = RE_GetShaderImageDimensions;
+    re.GetShaderImageData     = RE_GetShaderImageData;
+    re.GetSingleShader        = RE_GetSingleShader;
 
-	return &re;
+    return &re;
 }
 
 #endif /* USE_WEBGPU */
