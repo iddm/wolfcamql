@@ -46,6 +46,9 @@ endif
 ifndef BUILD_RENDERER_OPENGL2
   BUILD_RENDERER_OPENGL2=
 endif
+ifndef BUILD_RENDERER_WEBGPU
+  BUILD_RENDERER_WEBGPU=0
+endif
 ifndef BUILD_AUTOUPDATER  # DON'T build unless you mean to!
   BUILD_AUTOUPDATER=0
 endif
@@ -203,6 +206,11 @@ ifndef USE_FREETYPE
 USE_FREETYPE=0
 endif
 
+# Enable WebGPU renderer for Emscripten builds (requires USE_WEBGPU=1, overrides WebGL)
+ifndef USE_WEBGPU
+USE_WEBGPU=0
+endif
+
 ifndef USE_INTERNAL_LIBS
 USE_INTERNAL_LIBS=1
 endif
@@ -280,6 +288,7 @@ SDIR=$(MOUNT_DIR)/server
 RCOMMONDIR=$(MOUNT_DIR)/renderercommon
 RGL1DIR=$(MOUNT_DIR)/renderergl1
 RGL2DIR=$(MOUNT_DIR)/renderergl2
+RWGPUDIR=$(MOUNT_DIR)/rendererwebgpu
 CMDIR=$(MOUNT_DIR)/qcommon
 SDLDIR=$(MOUNT_DIR)/sdl
 ASMDIR=$(MOUNT_DIR)/asm
@@ -1173,7 +1182,17 @@ ifeq ($(PLATFORM),emscripten)
 
   CLIENT_LDFLAGS+=-s TOTAL_MEMORY=256MB
   CLIENT_LDFLAGS+=-s STACK_SIZE=5MB
-  CLIENT_LDFLAGS+=-s MIN_WEBGL_VERSION=1 -s MAX_WEBGL_VERSION=2
+
+  ifeq ($(USE_WEBGPU),1)
+    # WebGPU path: enable Emscripten WebGPU support, disable WebGL
+    CLIENT_CFLAGS+=-DUSE_WEBGPU
+    CLIENT_LDFLAGS+=-sUSE_WEBGPU=1
+    BUILD_RENDERER_OPENGL2=0
+    BUILD_RENDERER_WEBGPU=1
+  else
+    # Default WebGL path
+    CLIENT_LDFLAGS+=-s MIN_WEBGL_VERSION=1 -s MAX_WEBGL_VERSION=2
+  endif
 
   # The HTML file can use these functions to load extra files before the game starts.
   CLIENT_LDFLAGS+=-s EXPORTED_RUNTIME_METHODS=FS,addRunDependency,removeRunDependency
@@ -1273,6 +1292,9 @@ ifneq ($(BUILD_CLIENT),0)
     ifneq ($(BUILD_RENDERER_OPENGL2),0)
       TARGETS += $(B)/$(CLIENTBIN)_opengl2$(FULLBINEXT)
     endif
+    ifneq ($(BUILD_RENDERER_WEBGPU),0)
+      TARGETS += $(B)/$(CLIENTBIN)_webgpu$(FULLBINEXT)
+    endif
   endif
 endif
 
@@ -1347,6 +1369,12 @@ ifeq ($(PLATFORM),emscripten)
         GENERATEDTARGETS += $(B)/$(CLIENTBIN)_opengl2.$(ARCH).wasm
         ifeq ($(EMSCRIPTEN_PRELOAD_FILE),1)
           GENERATEDTARGETS += $(B)/$(CLIENTBIN)_opengl2.$(ARCH).data
+        endif
+      endif
+      ifneq ($(BUILD_RENDERER_WEBGPU),0)
+        GENERATEDTARGETS += $(B)/$(CLIENTBIN)_webgpu.$(ARCH).wasm
+        ifeq ($(EMSCRIPTEN_PRELOAD_FILE),1)
+          GENERATEDTARGETS += $(B)/$(CLIENTBIN)_webgpu.$(ARCH).data
         endif
       endif
     endif
@@ -1815,6 +1843,7 @@ makedirs:
 	@$(MKDIR) $(B)/renderergl1
 	@$(MKDIR) $(B)/renderergl2
 	@$(MKDIR) $(B)/renderergl2/glsl
+	@$(MKDIR) $(B)/rendererwebgpu
 	@$(MKDIR) $(B)/ded
 	@$(MKDIR) $(B)/$(BASEGAME)/cgame
 	@$(MKDIR) $(B)/$(BASEGAME)/game
@@ -2260,6 +2289,9 @@ Q3R2STRINGOBJ = \
   $(B)/renderergl2/glsl/texturenocolor_vp.o \
   $(B)/renderergl2/glsl/tonemap_fp.o \
   $(B)/renderergl2/glsl/tonemap_vp.o
+
+Q3RWGPUOBJ = \
+  $(B)/rendererwebgpu/tr_init.o
 
 Q3ROBJ = \
   $(B)/renderergl1/tr_altivec.o \
@@ -2721,6 +2753,12 @@ $(B)/$(CLIENTBIN)_opengl2$(FULLBINEXT): $(Q3OBJ) $(Q3R2OBJ) $(Q3R2STRINGOBJ) $(J
 	$(Q)$(CXX) $(CLIENT_CFLAGS) $(CFLAGS) $(CLIENT_LDFLAGS) $(LDFLAGS) \
 		$(NOTSHLIBLDFLAGS) -o $@ $(Q3OBJ) $(Q3R2OBJ) $(Q3R2STRINGOBJ) $(JPGOBJ) $(SPLINES) \
 		$(LIBSDLMAIN) $(CLIENT_LIBS) $(RENDERER_LIBS) $(LIBS)
+
+$(B)/$(CLIENTBIN)_webgpu$(FULLBINEXT): $(Q3OBJ) $(Q3RWGPUOBJ) $(SPLINES) $(LIBSDLMAIN)
+	$(echo_cmd) "LD $@"
+	$(Q)$(CXX) $(CLIENT_CFLAGS) $(CFLAGS) $(CLIENT_LDFLAGS) $(LDFLAGS) \
+		$(NOTSHLIBLDFLAGS) -o $@ $(Q3OBJ) $(Q3RWGPUOBJ) $(SPLINES) \
+		$(LIBSDLMAIN) $(CLIENT_LIBS) $(LIBS)
 
 endif
 endif
@@ -3384,6 +3422,8 @@ $(B)/renderergl2/%.o: $(RCOMMONDIR)/%.c
 $(B)/renderergl2/%.o: $(RGL2DIR)/%.c
 	$(DO_REF_CC)
 
+$(B)/rendererwebgpu/%.o: $(RWGPUDIR)/%.c
+	$(DO_CC)
 
 $(B)/ded/%.o: $(ASMDIR)/%.S
 	$(DO_AS)
@@ -3515,11 +3555,16 @@ $(B)/$(MISSIONPACK)/qcommon/%.asm: $(CMDIR)/%.c $(Q3LCC)
 #############################################################################
 
 EMSCRIPTEN_PRELOAD_FILE_SWITCH := $(if $(filter 1,$(EMSCRIPTEN_PRELOAD_FILE)),ON,OFF)
+ifeq ($(USE_WEBGPU),1)
+  CLIENT_BINARY_SUFFIX := webgpu
+else
+  CLIENT_BINARY_SUFFIX := opengl2
+endif
 $(B)/$(CLIENTBIN).html: $(WEBDIR)/client.html.in
 	$(echo_cmd) "SED $@"
 	$(Q)sed \
 		-e 's/@CLIENT_NAME@/$(CLIENTBIN)/g;' \
-		-e 's/@CLIENT_BINARY@/$(CLIENTBIN)_opengl2.$(ARCH)/g;' \
+		-e 's/@CLIENT_BINARY@/$(CLIENTBIN)_$(CLIENT_BINARY_SUFFIX).$(ARCH)/g;' \
 		-e 's/@BASEGAME@/$(BASEGAME)/g;' \
 		-e 's/@EMSCRIPTEN_PRELOAD_FILE@/$(EMSCRIPTEN_PRELOAD_FILE_SWITCH)/g' \
 		< $< > $@
