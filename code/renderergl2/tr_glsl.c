@@ -262,8 +262,8 @@ static void GLSL_GetShaderHeader( GLenum shaderType, const GLchar *extra, char *
 
 		if (qglesMajorVersion >= 2)
 		{
-			Q_strcat(dest, size, "precision mediump float;\n");
-			Q_strcat(dest, size, "precision mediump sampler2DShadow;\n");
+			Q_strcat(dest, size, "precision highp float;\n");
+			Q_strcat(dest, size, "precision highp sampler2DShadow;\n");
 		}
 
 		if(shaderType == GL_VERTEX_SHADER)
@@ -295,11 +295,11 @@ static void GLSL_GetShaderHeader( GLenum shaderType, const GLchar *extra, char *
 				Q_strcat(dest, size, extra);
 			}
 
-			Q_strcat(dest, size, "precision mediump float;\n");
+			Q_strcat(dest, size, "precision highp float;\n");
 
 			if (glRefConfig.shadowSamplers)
 			{
-				Q_strcat(dest, size, "precision mediump sampler2DShadow;\n");
+				Q_strcat(dest, size, "precision highp sampler2DShadow;\n");
 				Q_strcat(dest, size, "#define shadow2D(a,b) shadow2DEXT(a,b)\n");
 			}
 		}

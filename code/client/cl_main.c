@@ -3400,8 +3400,9 @@ static EM_BOOL CL_WsDemoOnClose(int eventType,
 
 static void CL_EmFetchOnProgress(emscripten_fetch_t *fetch)
 {
-	/* EMSCRIPTEN_FETCH_STREAM_DATA: fetch->data holds only the NEW bytes
-	 * received since the last onprogress call. */
+	/* Not registered as an onprogress callback (LOAD_TO_MEMORY delivers all
+	 * data at once in onsuccess).  Kept as a write helper called from
+	 * CL_EmFetchOnSuccess and CL_EmFetchOnError. */
 	if (fetch->numBytes > 0 && httpDemoStream.writeFile) {
 		fwrite(fetch->data, 1, (size_t)fetch->numBytes, httpDemoStream.writeFile);
 		fflush(httpDemoStream.writeFile);
@@ -3410,11 +3411,13 @@ static void CL_EmFetchOnProgress(emscripten_fetch_t *fetch)
 
 static void CL_EmFetchOnSuccess(emscripten_fetch_t *fetch)
 {
-	/* Final progress chunk (if any). */
+	/* With EMSCRIPTEN_FETCH_LOAD_TO_MEMORY, fetch->data holds the complete
+	 * response body and fetch->numBytes equals the total byte count. */
 	CL_EmFetchOnProgress(fetch);
 	if (httpDemoStream.writeFile)
 		fflush(httpDemoStream.writeFile);
-	Com_Printf("^5HTTP demo stream: download complete\n");
+	Com_Printf("^5HTTP demo stream: download complete (%d bytes)\n",
+		(int)fetch->numBytes);
 	httpDemoStream.done    = qtrue;
 	httpDemoStream.emFetch = NULL;
 	emscripten_fetch_close(fetch);
@@ -3676,10 +3679,15 @@ static qboolean CL_StartHttpDemoStream(const char *url, char *tempPathOut, int t
 
 		emscripten_fetch_attr_init(&attr);
 		Com_Memcpy(attr.requestMethod, "GET", 4);
-		/* STREAM_DATA: onprogress receives only the new bytes each call.
-		 * Browser fetch() follows redirects by default (301/302/303/307/308). */
-		attr.attributes = EMSCRIPTEN_FETCH_STREAM_DATA;
-		attr.onprogress = CL_EmFetchOnProgress;
+		/* LOAD_TO_MEMORY: the browser buffers the complete response into a
+		 * malloc'd region pointed to by fetch->data (size = fetch->numBytes).
+		 * STREAM_DATA was used previously but XHR with responseType='arraybuffer'
+		 * does NOT expose partial data during onprogress events — xhr.response is
+		 * null until onload, so Emscripten's delta tracking yields 0 bytes in
+		 * every progress callback and also 0 remaining bytes in onsuccess (because
+		 * progressedBytes == totalBytes after the accounting update in onprogress).
+		 * LOAD_TO_MEMORY guarantees the full content arrives in onsuccess. */
+		attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;
 		attr.onsuccess  = CL_EmFetchOnSuccess;
 		attr.onerror    = CL_EmFetchOnError;
 
@@ -6252,6 +6260,16 @@ static void CL_CheckWorkshopDownload (void)
 	clc.demoWorkshopsString = NULL;
 	clc.state = CA_CONNECTED;
 
+#ifdef __EMSCRIPTEN__
+	/* Demo file not yet available (async fetch in progress).  CL_Frame
+	 * will open the file and run the gamestate read loop below once
+	 * CL_StreamDemoFileSize() >= 8.  Running CL_ReadDemoMessage here
+	 * with demoReadFile == 0 would call CL_DemoCompleted() and disconnect. */
+	if (httpDemoStream.waitingForFirstData) {
+		return;
+	}
+#endif
+
 	// read demo messages until connected
 	while ( clc.state >= CA_CONNECTED && clc.state < CA_PRIMED ) {
 		//Com_Printf("reading demo messages until connected\n");
@@ -6365,10 +6383,34 @@ void CL_Frame ( int msec, double fmsec ) {
 			clc.demoplaying = qtrue;
 			clc.demoPlayBegin = Sys_Milliseconds();
 			Com_Printf("^5HTTP demo stream: data ready, starting playback\n");
+			/* Advance through initial gamestate messages to CA_PRIMED,
+			 * matching what CL_CheckWorkshopDownload's done: section does for
+			 * non-Emscripten builds.  Break early if data is not yet fully
+			 * available (streaming guard); the recovery block below will
+			 * continue one message per frame until CA_PRIMED is reached. */
+			while ( clc.state >= CA_CONNECTED && clc.state < CA_PRIMED ) {
+				CL_ReadDemoMessage(qfalse);
+				if (di.waitingForStream) {
+					break;
+				}
+			}
+			if (clc.state >= CA_PRIMED) {
+				clc.firstDemoFrameSkipped = qfalse;
+			}
 		} else if (httpDemoStream.done) {
 			/* Transfer finished but no/little data - error or empty response */
 			Com_Printf("^1HTTP demo stream: no data received\n");
 			CL_CleanupDemoStreams();
+		}
+	}
+	/* Streaming recovery: if the gamestate read loop above broke early
+	 * because data was not yet available (di.waitingForStream), keep
+	 * retrying one message per frame until state reaches CA_PRIMED. */
+	if (!httpDemoStream.waitingForFirstData && httpDemoStream.active &&
+	    clc.state == CA_CONNECTED && clc.demoplaying && clc.demoReadFile) {
+		CL_ReadDemoMessage(qfalse);
+		if (!di.waitingForStream && clc.state >= CA_PRIMED) {
+			clc.firstDemoFrameSkipped = qfalse;
 		}
 	}
 #endif
