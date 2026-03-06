@@ -37,6 +37,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #  include <windows.h>
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  include <sys/stat.h>
    typedef SOCKET clDemoSock_t;
 #  define CL_DEMO_INVALID_SOCK  INVALID_SOCKET
 #  define cl_demo_closesocket   closesocket
@@ -51,6 +52,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #else
 /* POSIX */
 #  include <sys/socket.h>
+#  include <sys/stat.h>
 #  include <netdb.h>
 #  include <unistd.h>
 #  include <pthread.h>
@@ -96,6 +98,7 @@ static clHttpDemoStream_t httpDemoStream;
 /* Forward declarations for demo stream helpers (defined later, near the
  * /streamdemo and /demo command handlers). */
 static void CL_CleanupDemoStreams(void);
+static int  CL_StreamDemoFileSize(void);
 
 #ifdef USE_LOCAL_HEADERS
 #       include "SDL_opengl.h"
@@ -469,7 +472,7 @@ void CL_VoipParseTargets(void)
 
 		if(!*target)
 			break;
-		
+
 		if(isdigit(*target))
 		{
 			val = strtol(target, &end, 10);
@@ -3246,6 +3249,36 @@ static qhandle_t CL_DemoStream_OpenForRead(const char *path)
 }
 
 /*
+ * Return current size of the streaming demo temp file without using fseek(SEEK_END).
+ * Used so we can pump the HTTP download and check when we have data; also avoids
+ * SEEK_END on a file being written by another handle (can block on some systems).
+ * Returns -1 on error.
+ */
+static int CL_StreamDemoFileSize(void)
+{
+	const char *path = NULL;
+#ifdef _WIN32
+	struct _stat st;
+	if (httpDemoStream.active && httpDemoStream.tempPath[0])
+		path = httpDemoStream.tempPath;
+	else if (tcpDemoStream.active && tcpDemoStream.tempPath[0])
+		path = tcpDemoStream.tempPath;
+	if (!path || _stat(path, &st) != 0)
+		return -1;
+	return (int)st.st_size;
+#else
+	struct stat st;
+	if (httpDemoStream.active && httpDemoStream.tempPath[0])
+		path = httpDemoStream.tempPath;
+	else if (tcpDemoStream.active && tcpDemoStream.tempPath[0])
+		path = tcpDemoStream.tempPath;
+	if (!path || stat(path, &st) != 0)
+		return -1;
+	return (int)st.st_size;
+#endif
+}
+
+/*
  * Clean up both the TCP and HTTP demo streams.
  * Safe to call at any time; does nothing if not active.
  */
@@ -3641,7 +3674,8 @@ static qboolean CL_StartHttpDemoStream(const char *url, char *tempPathOut, int t
 
 		emscripten_fetch_attr_init(&attr);
 		Com_Memcpy(attr.requestMethod, "GET", 4);
-		/* STREAM_DATA: onprogress receives only the new bytes each call. */
+		/* STREAM_DATA: onprogress receives only the new bytes each call.
+		 * Browser fetch() follows redirects by default (301/302/303/307/308). */
 		attr.attributes = EMSCRIPTEN_FETCH_STREAM_DATA;
 		attr.onprogress = CL_EmFetchOnProgress;
 		attr.onsuccess  = CL_EmFetchOnSuccess;
@@ -3674,6 +3708,27 @@ static qboolean CL_StartHttpDemoStream(const char *url, char *tempPathOut, int t
 		return qfalse;
 	}
 	Com_Printf("^5HTTP demo stream: downloading '%s' ...\n", url);
+
+	/* Native curl only sets up the transfer; no bytes are received until
+	 * CL_HTTP_PollDemoStream runs. Pump until we have at least some data
+	 * (or transfer finishes) so the reader sees a non-empty file.
+	 * Sleep between pumps so redirects and slow servers have time to respond. */
+	{
+		int iter = 0;
+		const int max_pump = 300;  /* ~3s at 10ms each; redirects (e.g. is.gd) need time */
+		while (iter < max_pump) {
+			if (CL_HTTP_PollDemoStream()) {
+				httpDemoStream.done = qtrue;  /* transfer finished in pump loop */
+				break;
+			}
+			iter++;
+			if (CL_StreamDemoFileSize() >= 8)
+				break;  /* enough for first seq+length */
+			Sys_Sleep(10);  /* 10ms: give network/redirect time, avoid busy spin */
+		}
+		if (iter >= max_pump && CL_StreamDemoFileSize() < 8)
+			Com_Printf("^3HTTP demo stream: no data after %.1fs, continuing anyway\n", (max_pump * 10) / 1000.0);
+	}
 #else
 	(void)url;
 	Com_Printf("^1HTTP demo stream: not compiled with HTTP support\n");
@@ -3715,7 +3770,7 @@ void CL_PlayDemo_f (void)
 	n = Cmd_Argc();
 
 	if (n < 2) {
-		Com_Printf("demo <demoname1> <demoname2> ...\n");
+		Com_Printf("demo <demoname1> <demoname2> ... or demo <url>\n");
 		return;
 	}
 
@@ -3731,13 +3786,17 @@ void CL_PlayDemo_f (void)
 
 	arg = DemoNames[0];
 
+	Com_Printf("^5HTTP demo demo file: '%s' ...\n", arg);
+
 	// handle http/https URLs: stream the demo file from a remote server
 	if (!Q_stricmpn(arg, "http://", 7) || !Q_stricmpn(arg, "https://", 8)) {
 		char tempPath[MAX_OSPATH];
+		Com_Printf("^5HTTP demo stream: downloading '%s' ...\n", arg);
 
 		CL_Disconnect( qtrue );
 
 		if (!CL_StartHttpDemoStream(arg, tempPath, sizeof(tempPath))) {
+			Com_Printf("^1HTTP demo stream: could not start download\n");
 			return;
 		}
 
@@ -3868,7 +3927,7 @@ void CL_StreamDemo_f (void)
 	n = Cmd_Argc();
 
 	if (n < 2) {
-		Com_Printf("streamdemo <demoname>\n");
+		Com_Printf("streamdemo <demo filename or tcp://url>\n");
 		return;
 	}
 
@@ -4906,7 +4965,7 @@ void CL_Vid_Restart_f (void)
 			// clear the whole hunk
 			Hunk_Clear();
 		}
-	
+
 		// shutdown the UI
 		CL_ShutdownUI();
 		// shutdown the CGame

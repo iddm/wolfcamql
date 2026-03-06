@@ -398,8 +398,9 @@ qboolean CL_HTTP_BeginDemoStream(const char *url, FILE *outFile)
 	qcurl_easy_setopt(demoCURL, CURLOPT_WRITEDATA,        demoWriteFile);
 	qcurl_easy_setopt(demoCURL, CURLOPT_NOPROGRESS,       1L);
 	qcurl_easy_setopt(demoCURL, CURLOPT_FAILONERROR,      1L);
+	/* Follow redirects so URL shorteners (is.gd, bit.ly, etc.) yield the actual file. */
 	qcurl_easy_setopt(demoCURL, CURLOPT_FOLLOWLOCATION,   1L);
-	qcurl_easy_setopt(demoCURL, CURLOPT_MAXREDIRS,        5L);
+	qcurl_easy_setopt(demoCURL, CURLOPT_MAXREDIRS,        10L);
 #if CURL_AT_LEAST_VERSION(7,85,0)
 	qcurl_easy_setopt(demoCURL, CURLOPT_PROTOCOLS_STR,    "http,https");
 #else

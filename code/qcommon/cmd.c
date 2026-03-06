@@ -1027,8 +1027,13 @@ static void Cmd_TokenizeString2( const char *text_in, qboolean ignoreQuotes ) {
 				break;
 			}
 
+			/* Don't treat "//" as comment when it's a URL protocol (e.g. https://).
+			 * In input, "//" is preceded by ':' in "http://" or "https://". */
 			if ( text[0] == '/' && text[1] == '/' ) {
-				break;
+				if ( text > (const unsigned char *)text_in && text[-1] == ':' )
+					; /* protocol scheme, keep copying */
+				else
+					break;
 			}
 
 			// skip /* */ comments
