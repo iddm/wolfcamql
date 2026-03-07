@@ -125,6 +125,9 @@ static const char *k_wgsl3D =
     "fn vs_main(v : VIn) -> VOut {\n"
     "  var o : VOut;\n"
     "  o.pos = u.mvp * vec4<f32>(v.pos, 1.0);\n"
+    /* Remap OpenGL NDC depth z ∈ [-w,+w] → WebGPU depth z ∈ [0,w].
+       This lets us reuse the exact same projection matrix as renderergl2. */
+    "  o.pos.z = (o.pos.z + o.pos.w) * 0.5;\n"
     "  o.uv  = v.uv;\n"
     "  return o;\n"
     "}\n"
@@ -342,6 +345,184 @@ static void WR_BuildPipeline2D( wgpuBlend_t blend )
 #endif
 
 /* =========================================================================
+ * BuildBindGroupLayout3D – BGL for the 3D pipeline:
+ *   binding 0: uniform buffer  (vertex + fragment)
+ *   binding 1: texture_2d      (fragment)
+ *   binding 2: sampler         (fragment)
+ * ========================================================================= */
+
+#ifdef __EMSCRIPTEN__
+static WGPUBindGroupLayout BuildBindGroupLayout3D( void )
+{
+    WGPUBindGroupLayoutEntry     entries[3];
+    WGPUBindGroupLayoutDescriptor desc;
+
+    Com_Memset( entries, 0, sizeof( entries ) );
+
+    entries[0].binding               = 0;
+    entries[0].visibility            = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+    entries[0].buffer.type           = WGPUBufferBindingType_Uniform;
+    entries[0].buffer.minBindingSize = sizeof( wgpuUniforms3D_t );
+
+    entries[1].binding                  = 1;
+    entries[1].visibility               = WGPUShaderStage_Fragment;
+    entries[1].texture.sampleType       = WGPUTextureSampleType_Float;
+    entries[1].texture.viewDimension    = WGPUTextureViewDimension_2D;
+    entries[1].texture.multisampled     = 0;
+
+    entries[2].binding      = 2;
+    entries[2].visibility   = WGPUShaderStage_Fragment;
+    entries[2].sampler.type = WGPUSamplerBindingType_Filtering;
+
+    Com_Memset( &desc, 0, sizeof( desc ) );
+    desc.entryCount = 3;
+    desc.entries    = entries;
+    desc.label      = "BGL 3D";
+
+    return wgpuDeviceCreateBindGroupLayout( wgpu.device, &desc );
+}
+#endif
+
+/* =========================================================================
+ * WR_BuildPipeline3D – create a 3D render pipeline for a given blend mode.
+ * ========================================================================= */
+
+#ifdef __EMSCRIPTEN__
+static void WR_BuildPipeline3D( wgpuBlend_t blend )
+{
+    wgpuPipeline_t             *p = &wgpu.pipe3D[blend];
+    WGPUBindGroupLayout         bgl;
+    WGPUPipelineLayoutDescriptor plDesc;
+    WGPURenderPipelineDescriptor rpDesc;
+    WGPUVertexAttribute         attrs[2];
+    WGPUVertexBufferLayout      vbLayout;
+    WGPUBlendState              blendState;
+    WGPUColorTargetState        colorTarget;
+    WGPUDepthStencilState       depthStencil;
+
+    bgl = BuildBindGroupLayout3D();
+
+    Com_Memset( &plDesc, 0, sizeof( plDesc ) );
+    plDesc.bindGroupLayoutCount = 1;
+    plDesc.bindGroupLayouts     = &bgl;
+    plDesc.label                = "PL 3D";
+
+    p->bgl    = bgl;
+    p->layout = wgpuDeviceCreatePipelineLayout( wgpu.device, &plDesc );
+
+    /* ------------------------------------------------------------------
+     * Vertex attributes (stride = sizeof(wgpuVert3D_t) = 20)
+     *   attr 0: float32x3  pos  (offset  0)
+     *   attr 1: float32x2  uv   (offset 12)
+     * ------------------------------------------------------------------ */
+    Com_Memset( attrs, 0, sizeof( attrs ) );
+
+    attrs[0].shaderLocation = 0;
+    attrs[0].format         = WGPUVertexFormat_Float32x3;
+    attrs[0].offset         = 0;
+
+    attrs[1].shaderLocation = 1;
+    attrs[1].format         = WGPUVertexFormat_Float32x2;
+    attrs[1].offset         = 12;
+
+    Com_Memset( &vbLayout, 0, sizeof( vbLayout ) );
+    vbLayout.arrayStride    = sizeof( wgpuVert3D_t );
+    vbLayout.stepMode       = WGPUVertexStepMode_Vertex;
+    vbLayout.attributeCount = 2;
+    vbLayout.attributes     = attrs;
+
+    /* ------------------------------------------------------------------
+     * Blend state
+     * ------------------------------------------------------------------ */
+    Com_Memset( &blendState, 0, sizeof( blendState ) );
+
+    switch ( blend )
+    {
+    case WGPU_BLEND_ALPHA:
+        blendState.color.srcFactor = WGPUBlendFactor_SrcAlpha;
+        blendState.color.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+        blendState.color.operation = WGPUBlendOperation_Add;
+        blendState.alpha.srcFactor = WGPUBlendFactor_One;
+        blendState.alpha.dstFactor = WGPUBlendFactor_OneMinusSrcAlpha;
+        blendState.alpha.operation = WGPUBlendOperation_Add;
+        break;
+
+    case WGPU_BLEND_ADD:
+        blendState.color.srcFactor = WGPUBlendFactor_SrcAlpha;
+        blendState.color.dstFactor = WGPUBlendFactor_One;
+        blendState.color.operation = WGPUBlendOperation_Add;
+        blendState.alpha.srcFactor = WGPUBlendFactor_Zero;
+        blendState.alpha.dstFactor = WGPUBlendFactor_One;
+        blendState.alpha.operation = WGPUBlendOperation_Add;
+        break;
+
+    default: /* WGPU_BLEND_OPAQUE */
+        blendState.color.srcFactor = WGPUBlendFactor_One;
+        blendState.color.dstFactor = WGPUBlendFactor_Zero;
+        blendState.color.operation = WGPUBlendOperation_Add;
+        blendState.alpha.srcFactor = WGPUBlendFactor_One;
+        blendState.alpha.dstFactor = WGPUBlendFactor_Zero;
+        blendState.alpha.operation = WGPUBlendOperation_Add;
+        break;
+    }
+
+    Com_Memset( &colorTarget, 0, sizeof( colorTarget ) );
+    colorTarget.format    = WGPUTextureFormat_BGRA8Unorm;
+    colorTarget.blend     = &blendState;
+    colorTarget.writeMask = WGPUColorWriteMask_All;
+
+    /* ------------------------------------------------------------------
+     * Depth/stencil
+     * ------------------------------------------------------------------ */
+    Com_Memset( &depthStencil, 0, sizeof( depthStencil ) );
+    depthStencil.format            = WGPUTextureFormat_Depth24PlusStencil8;
+    depthStencil.depthWriteEnabled = ( blend == WGPU_BLEND_OPAQUE ) ? 1 : 0;
+    depthStencil.depthCompare      = WGPUCompareFunction_LessEqual;
+    depthStencil.stencilFront.compare = WGPUCompareFunction_Always;
+    depthStencil.stencilBack.compare  = WGPUCompareFunction_Always;
+
+    /* ------------------------------------------------------------------
+     * Pipeline descriptor
+     * ------------------------------------------------------------------ */
+    Com_Memset( &rpDesc, 0, sizeof( rpDesc ) );
+    rpDesc.label  = "RP 3D";
+    rpDesc.layout = p->layout;
+
+    rpDesc.vertex.module      = wgpu.shaderMod3D;
+    rpDesc.vertex.entryPoint  = "vs_main";
+    rpDesc.vertex.bufferCount = 1;
+    rpDesc.vertex.buffers     = &vbLayout;
+
+    rpDesc.primitive.topology         = WGPUPrimitiveTopology_TriangleList;
+    rpDesc.primitive.stripIndexFormat = WGPUIndexFormat_Undefined;
+    rpDesc.primitive.frontFace        = WGPUFrontFace_CCW;
+    rpDesc.primitive.cullMode         = WGPUCullMode_None;  /* Q3 has two-sided surfaces */
+
+    rpDesc.multisample.count = 1;
+    rpDesc.multisample.mask  = 0xFFFFFFFF;
+
+    {
+        WGPUFragmentState fragState;
+        Com_Memset( &fragState, 0, sizeof( fragState ) );
+        fragState.module      = wgpu.shaderMod3D;
+        fragState.entryPoint  = "fs_main";
+        fragState.targetCount = 1;
+        fragState.targets     = &colorTarget;
+        rpDesc.fragment       = &fragState;
+    }
+
+    rpDesc.depthStencil = &depthStencil;
+
+    p->pipeline = wgpuDeviceCreateRenderPipeline( wgpu.device, &rpDesc );
+    if ( !p->pipeline )
+        ri.Error( ERR_FATAL, "WR_BuildPipeline3D: pipeline creation failed (blend=%d)", blend );
+
+    p->blend = blend;
+    p->valid = qtrue;
+}
+#endif
+
+/* =========================================================================
  * WR_InitPipelines – build all cached pipelines.
  * ========================================================================= */
 
@@ -350,7 +531,10 @@ void WR_InitPipelines( void )
 #ifdef __EMSCRIPTEN__
     int i;
     for ( i = 0; i < WGPU_BLEND_COUNT; i++ )
+    {
         WR_BuildPipeline2D( (wgpuBlend_t)i );
+        WR_BuildPipeline3D( (wgpuBlend_t)i );
+    }
 #endif
 }
 
@@ -363,6 +547,17 @@ wgpuPipeline_t *WR_GetPipeline2D( wgpuBlend_t blend )
     if ( (unsigned)blend >= WGPU_BLEND_COUNT )
         blend = WGPU_BLEND_ALPHA;
     return &wgpu.pipe2D[blend];
+}
+
+/* =========================================================================
+ * WR_GetPipeline3D – return a cached 3D pipeline.
+ * ========================================================================= */
+
+wgpuPipeline_t *WR_GetPipeline3D( wgpuBlend_t blend )
+{
+    if ( (unsigned)blend >= WGPU_BLEND_COUNT )
+        blend = WGPU_BLEND_OPAQUE;
+    return &wgpu.pipe3D[blend];
 }
 
 /* =========================================================================
@@ -402,6 +597,49 @@ WGPUBindGroup WR_MakeBindGroup2D( const wgpuPipeline_t *pipe,
     return wgpuDeviceCreateBindGroup( wgpu.device, &desc );
 #else
     (void)pipe; (void)ub; (void)tv; (void)samp;
+    return NULL;
+#endif
+}
+
+/* =========================================================================
+ * WR_MakeBindGroup3D – create a bind group for one 3D draw call.
+ *
+ * ubOffset is the byte offset within ub3D for this draw's uniforms.
+ * Caller must release the returned WGPUBindGroup after the pass ends.
+ * ========================================================================= */
+
+WGPUBindGroup WR_MakeBindGroup3D( const wgpuPipeline_t *pipe,
+                                   WGPUBuffer ub,
+                                   uint64_t ubOffset,
+                                   WGPUTextureView tv,
+                                   WGPUSampler samp )
+{
+#ifdef __EMSCRIPTEN__
+    WGPUBindGroupEntry      entries[3];
+    WGPUBindGroupDescriptor desc;
+
+    Com_Memset( entries, 0, sizeof( entries ) );
+
+    entries[0].binding = 0;
+    entries[0].buffer  = ub;
+    entries[0].offset  = ubOffset;
+    entries[0].size    = sizeof( wgpuUniforms3D_t );
+
+    entries[1].binding     = 1;
+    entries[1].textureView = tv;
+
+    entries[2].binding = 2;
+    entries[2].sampler = samp;
+
+    Com_Memset( &desc, 0, sizeof( desc ) );
+    desc.layout     = pipe->bgl;
+    desc.entryCount = 3;
+    desc.entries    = entries;
+    desc.label      = "BG 3D draw";
+
+    return wgpuDeviceCreateBindGroup( wgpu.device, &desc );
+#else
+    (void)pipe; (void)ub; (void)ubOffset; (void)tv; (void)samp;
     return NULL;
 #endif
 }

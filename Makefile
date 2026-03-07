@@ -2305,6 +2305,8 @@ Q3RWGPUOBJ = \
   $(B)/rendererwebgpu/tr_shader.o \
   $(B)/rendererwebgpu/tr_wgsl.o \
   $(B)/rendererwebgpu/tr_backend.o \
+  $(B)/rendererwebgpu/tr_world.o \
+  $(B)/rendererwebgpu/tr_model.o \
   $(B)/rendererwebgpu/tr_image_tga.o \
   $(B)/rendererwebgpu/tr_image_jpg.o \
   $(B)/rendererwebgpu/tr_image_png.o \
