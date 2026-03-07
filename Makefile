@@ -1184,9 +1184,10 @@ ifeq ($(PLATFORM),emscripten)
   CLIENT_LDFLAGS+=-s STACK_SIZE=5MB
 
   ifeq ($(USE_WEBGPU),1)
-    # WebGPU path: enable Emscripten WebGPU support, disable WebGL
-    CLIENT_CFLAGS+=-DUSE_WEBGPU
-    CLIENT_LDFLAGS+=-sUSE_WEBGPU=1
+    # WebGPU path: emdawnwebgpu port (Emscripten 5+), disable WebGL
+    # ASYNCIFY is required for the async adapter/device request callbacks.
+    CLIENT_CFLAGS+=-DUSE_WEBGPU --use-port=emdawnwebgpu
+    CLIENT_LDFLAGS+=--use-port=emdawnwebgpu -sASYNCIFY=1
     BUILD_RENDERER_OPENGL2=0
     BUILD_RENDERER_WEBGPU=1
   else

@@ -304,11 +304,24 @@ void WR_BeginFrame( void )
     wgpu.numPolys3D      = 0;
     wgpu.haveRefdef      = qfalse;
 
-    /* Acquire current swap-chain view */
-    wgpu.frameView = wgpuSwapChainGetCurrentTextureView( wgpu.swapChain );
+    /* Acquire current surface texture (replaces wgpuSwapChainGetCurrentTextureView) */
+    {
+        WGPUSurfaceTexture surfTex;
+        Com_Memset( &surfTex, 0, sizeof( surfTex ) );
+        wgpuSurfaceGetCurrentTexture( wgpu.surface, &surfTex );
+        if ( !surfTex.texture )
+        {
+            ri.Printf( PRINT_WARNING, "WR_BeginFrame: wgpuSurfaceGetCurrentTexture failed\n" );
+            return;
+        }
+        wgpu.frameTex  = surfTex.texture;
+        wgpu.frameView = wgpuTextureCreateView( wgpu.frameTex, NULL );
+    }
     if ( !wgpu.frameView )
     {
-        ri.Printf( PRINT_WARNING, "WR_BeginFrame: no swap chain texture\n" );
+        ri.Printf( PRINT_WARNING, "WR_BeginFrame: wgpuTextureCreateView failed\n" );
+        wgpuTextureRelease( wgpu.frameTex );
+        wgpu.frameTex = NULL;
         return;
     }
 
@@ -405,7 +418,7 @@ static void Flush3D( WGPURenderPassEncoder pass )
         /* Vertex buffer (skip if same as last draw) */
         if ( d->vb != curVB )
         {
-            wgpuRenderPassEncoderSetVertexBuffer( pass, 0, d->vb, 0, WGPUSIZE_WHOLE );
+            wgpuRenderPassEncoderSetVertexBuffer( pass, 0, d->vb, 0, WGPU_WHOLE_SIZE );
             curVB = d->vb;
         }
 
@@ -414,7 +427,7 @@ static void Flush3D( WGPURenderPassEncoder pass )
         {
             wgpuRenderPassEncoderSetIndexBuffer( pass, d->ib,
                                                   WGPUIndexFormat_Uint32,
-                                                  0, WGPUSIZE_WHOLE );
+                                                  0, WGPU_WHOLE_SIZE );
             curIB = d->ib;
         }
 
@@ -458,7 +471,7 @@ static void Flush2D( WGPURenderPassEncoder pass )
     wgpuQueueWriteBuffer( wgpu.queue, wgpu.ub2D, 0, &ub, sizeof( ub ) );
 
     /* Set vertex buffer once – all 2D draws share the same VBO */
-    wgpuRenderPassEncoderSetVertexBuffer( pass, 0, wgpu.vb2D, 0, WGPUSIZE_WHOLE );
+    wgpuRenderPassEncoderSetVertexBuffer( pass, 0, wgpu.vb2D, 0, WGPU_WHOLE_SIZE );
 
     for ( i = 0; i < wgpu.numDraws2D; i++ )
     {
@@ -621,10 +634,12 @@ void WR_EndFrame( void )
         wgpu.encoder = NULL;
     }
 
-    wgpuSwapChainPresent( wgpu.swapChain );
+    wgpuSurfacePresent( wgpu.surface );
 
     wgpuTextureViewRelease( wgpu.frameView );
     wgpu.frameView = NULL;
+    wgpuTextureRelease( wgpu.frameTex );
+    wgpu.frameTex  = NULL;
     wgpu.inFrame   = qfalse;
 #endif
 }

@@ -43,9 +43,18 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../renderercommon/tr_common.h"
 
 #ifdef __EMSCRIPTEN__
-#include <SDL.h>
-#include <emscripten/html5_webgpu.h>
-#include <webgpu/webgpu.h>
+#  include <SDL.h>
+   /* Emscripten 5.x / emdawnwebgpu: standard Dawn WebGPU C header.
+      Old emscripten/html5_webgpu.h is gone; USE_WEBGPU flag is gone.
+      Build with:  --use-port=emdawnwebgpu  -sASYNCIFY=1              */
+#  include <webgpu/webgpu.h>
+#  include <emscripten.h>     /* emscripten_sleep for async init spin  */
+#endif
+
+/* WGPU_WHOLE_SIZE – standard Dawn constant that replaces old WGPUSIZE_WHOLE  */
+#ifndef WGPU_WHOLE_SIZE
+#  include <stdint.h>
+#  define WGPU_WHOLE_SIZE UINT64_MAX
 #endif
 
 /* =========================================================================
@@ -268,10 +277,13 @@ typedef struct {
     int              vidWidth;
     int              vidHeight;
 
+    WGPUAdapter      adapter;   /* kept alive for surface format queries */
     WGPUDevice       device;
     WGPUQueue        queue;
     WGPUSurface      surface;
-    WGPUSwapChain    swapChain;
+
+    /* Current frame's swap-surface texture (acquired each frame) */
+    WGPUTexture      frameTex;
 
     /* Depth/stencil texture */
     WGPUTexture      depthTex;
@@ -306,12 +318,9 @@ typedef struct {
     float            color2D[4];    /* set by RE_SetColor */
 
     /* ---- Per-frame encoding state ----------------------------------- */
-    WGPUTextureView    frameView;   /* swap chain texture view */
+    WGPUTextureView    frameView;   /* view of current frame surface texture */
     WGPUCommandEncoder encoder;
     qboolean           inFrame;
-
-    /* ---- 3D pipelines ----------------------------------------------- */
-    wgpuPipeline_t   pipe3D[WGPU_BLEND_COUNT];
 
     /* ---- World (BSP) static geometry -------------------------------- */
     WGPUBuffer       worldVB;

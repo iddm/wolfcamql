@@ -39,6 +39,45 @@ wgpuGlobals_t  wgpu;
 refimport_t    ri;
 glconfig_t     glConfig;
 
+/* =========================================================================
+ * Async WebGPU adapter/device request helpers (emdawnwebgpu / Emscripten 5)
+ *
+ * emscripten_webgpu_get_device() was removed.  We request adapter + device
+ * through the standard Dawn callbacks and use emscripten_sleep() (ASYNCIFY)
+ * to spin until they resolve.
+ * ========================================================================= */
+
+#ifdef __EMSCRIPTEN__
+
+static volatile int  s_wgpuAdapterReady = 0;
+static volatile int  s_wgpuDeviceReady  = 0;
+static WGPUAdapter   s_wgpuAdapter      = NULL;
+static WGPUDevice    s_wgpuDevice       = NULL;
+
+static void WR_AdapterCb( WGPURequestAdapterStatus status,
+                           WGPUAdapter adapter,
+                           char const *msg,
+                           void *userdata )
+{
+    (void)msg; (void)userdata;
+    if ( status == WGPURequestAdapterStatus_Success )
+        s_wgpuAdapter = adapter;
+    s_wgpuAdapterReady = 1;
+}
+
+static void WR_DeviceCb( WGPURequestDeviceStatus status,
+                          WGPUDevice device,
+                          char const *msg,
+                          void *userdata )
+{
+    (void)msg; (void)userdata;
+    if ( status == WGPURequestDeviceStatus_Success )
+        s_wgpuDevice = device;
+    s_wgpuDeviceReady = 1;
+}
+
+#endif /* __EMSCRIPTEN__ */
+
 /* Required by renderercommon (tr_subs.c, tr_noise.c, tr_font.c, …) */
 qboolean textureFilterAnisotropic = qfalse;
 int      maxAnisotropy            = 0;
@@ -139,11 +178,6 @@ void GLimp_Shutdown( void )
         wgpu.shaderMod3D = NULL;
     }
 
-    if ( wgpu.swapChain )
-    {
-        wgpuSwapChainRelease( wgpu.swapChain );
-        wgpu.swapChain = NULL;
-    }
     if ( wgpu.surface )
     {
         wgpuSurfaceRelease( wgpu.surface );
@@ -158,6 +192,11 @@ void GLimp_Shutdown( void )
     {
         wgpuDeviceRelease( wgpu.device );
         wgpu.device = NULL;
+    }
+    if ( wgpu.adapter )
+    {
+        wgpuAdapterRelease( wgpu.adapter );
+        wgpu.adapter = NULL;
     }
     if ( wgpu.window )
     {
@@ -210,10 +249,36 @@ void GLimp_Init( qboolean fixedFunction )
     wgpu.vidWidth  = width;
     wgpu.vidHeight = height;
 
-    /* ---- Acquire WebGPU device ---------------------------------------- */
-    wgpu.device = emscripten_webgpu_get_device();
-    if ( !wgpu.device )
-        ri.Error( ERR_FATAL, "GLimp_Init: emscripten_webgpu_get_device() returned NULL" );
+    /* ---- Acquire WebGPU adapter + device asynchronously --------------- */
+    /*
+     * emscripten_webgpu_get_device() was removed in Emscripten 5 / emdawnwebgpu.
+     * Use the standard Dawn async callbacks + emscripten_sleep (ASYNCIFY=1).
+     */
+    {
+        WGPUInstance instance = wgpuCreateInstance( NULL );
+
+        s_wgpuAdapterReady = 0;
+        s_wgpuAdapter      = NULL;
+        wgpuInstanceRequestAdapter( instance, NULL, WR_AdapterCb, NULL );
+        while ( !s_wgpuAdapterReady )
+            emscripten_sleep( 16 );
+
+        wgpuInstanceRelease( instance );
+
+        if ( !s_wgpuAdapter )
+            ri.Error( ERR_FATAL, "GLimp_Init: WebGPU adapter request failed" );
+        wgpu.adapter = s_wgpuAdapter;
+
+        s_wgpuDeviceReady = 0;
+        s_wgpuDevice      = NULL;
+        wgpuAdapterRequestDevice( wgpu.adapter, NULL, WR_DeviceCb, NULL );
+        while ( !s_wgpuDeviceReady )
+            emscripten_sleep( 16 );
+
+        if ( !s_wgpuDevice )
+            ri.Error( ERR_FATAL, "GLimp_Init: WebGPU device request failed" );
+        wgpu.device = s_wgpuDevice;
+    }
 
     wgpu.queue = wgpuDeviceGetQueue( wgpu.device );
 
@@ -221,7 +286,7 @@ void GLimp_Init( qboolean fixedFunction )
     {
         WGPUSurfaceDescriptorFromCanvasHTMLSelector canvasDesc;
         WGPUSurfaceDescriptor                       surfDesc;
-        WGPUInstance                                instance;
+        WGPUInstance                                inst2;
 
         Com_Memset( &canvasDesc, 0, sizeof( canvasDesc ) );
         canvasDesc.chain.sType = WGPUSType_SurfaceDescriptorFromCanvasHTMLSelector;
@@ -230,28 +295,26 @@ void GLimp_Init( qboolean fixedFunction )
         Com_Memset( &surfDesc, 0, sizeof( surfDesc ) );
         surfDesc.nextInChain = &canvasDesc.chain;
 
-        instance      = wgpuCreateInstance( NULL );
-        wgpu.surface  = wgpuInstanceCreateSurface( instance, &surfDesc );
-        wgpuInstanceRelease( instance );
+        inst2        = wgpuCreateInstance( NULL );
+        wgpu.surface = wgpuInstanceCreateSurface( inst2, &surfDesc );
+        wgpuInstanceRelease( inst2 );
 
         if ( !wgpu.surface )
             ri.Error( ERR_FATAL, "GLimp_Init: wgpuInstanceCreateSurface() failed" );
     }
 
-    /* ---- Create swap chain --------------------------------------------- */
+    /* ---- Configure surface (replaces SwapChain in emdawnwebgpu) ------- */
     {
-        WGPUSwapChainDescriptor scDesc;
-        Com_Memset( &scDesc, 0, sizeof( scDesc ) );
-        scDesc.usage       = WGPUTextureUsage_RenderAttachment;
-        scDesc.format      = WGPUTextureFormat_BGRA8Unorm;
-        scDesc.width       = (uint32_t)width;
-        scDesc.height      = (uint32_t)height;
-        scDesc.presentMode = WGPUPresentMode_Fifo;
-        scDesc.label       = "Main swap chain";
-
-        wgpu.swapChain = wgpuDeviceCreateSwapChain( wgpu.device, wgpu.surface, &scDesc );
-        if ( !wgpu.swapChain )
-            ri.Error( ERR_FATAL, "GLimp_Init: wgpuDeviceCreateSwapChain() failed" );
+        WGPUSurfaceConfiguration surfCfg;
+        Com_Memset( &surfCfg, 0, sizeof( surfCfg ) );
+        surfCfg.device      = wgpu.device;
+        surfCfg.format      = WGPUTextureFormat_BGRA8Unorm;
+        surfCfg.usage       = WGPUTextureUsage_RenderAttachment;
+        surfCfg.alphaMode   = WGPUCompositeAlphaMode_Opaque;
+        surfCfg.width       = (uint32_t)width;
+        surfCfg.height      = (uint32_t)height;
+        surfCfg.presentMode = WGPUPresentMode_Fifo;
+        wgpuSurfaceConfigure( wgpu.surface, &surfCfg );
     }
 
     /* ---- Depth texture ------------------------------------------------- */
