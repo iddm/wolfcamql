@@ -77,11 +77,13 @@ void GLimp_Shutdown( void )
 #ifdef __EMSCRIPTEN__
     WR_FreeImages();
 
-    if ( wgpu.verts2D )
-    {
-        ri.Free( wgpu.verts2D );
-        wgpu.verts2D = NULL;
-    }
+    WR_ClearWorld();
+    WR_FreeModels();
+
+    if ( wgpu.verts2D    ) { ri.Free( wgpu.verts2D );    wgpu.verts2D    = NULL; }
+    if ( wgpu.dynVerts3D ) { ri.Free( wgpu.dynVerts3D ); wgpu.dynVerts3D = NULL; }
+    if ( wgpu.dynIndexes3D ) { ri.Free( wgpu.dynIndexes3D ); wgpu.dynIndexes3D = NULL; }
+    if ( wgpu.ub3DData   ) { ri.Free( wgpu.ub3DData );   wgpu.ub3DData   = NULL; }
 
     if ( wgpu.vb2D )
     {
@@ -94,6 +96,24 @@ void GLimp_Shutdown( void )
         wgpuBufferDestroy( wgpu.ub2D );
         wgpuBufferRelease( wgpu.ub2D );
         wgpu.ub2D = NULL;
+    }
+    if ( wgpu.dynVB3D )
+    {
+        wgpuBufferDestroy( wgpu.dynVB3D );
+        wgpuBufferRelease( wgpu.dynVB3D );
+        wgpu.dynVB3D = NULL;
+    }
+    if ( wgpu.dynIB3D )
+    {
+        wgpuBufferDestroy( wgpu.dynIB3D );
+        wgpuBufferRelease( wgpu.dynIB3D );
+        wgpu.dynIB3D = NULL;
+    }
+    if ( wgpu.ub3D )
+    {
+        wgpuBufferDestroy( wgpu.ub3D );
+        wgpuBufferRelease( wgpu.ub3D );
+        wgpu.ub3D = NULL;
     }
 
     if ( wgpu.depthView )
@@ -292,6 +312,47 @@ void GLimp_Init( qboolean fixedFunction )
     if ( !wgpu.verts2D )
         ri.Error( ERR_FATAL, "GLimp_Init: failed to allocate 2D vertex staging buffer" );
 
+    /* ---- 3D per-frame dynamic vertex buffer --------------------------- */
+    {
+        WGPUBufferDescriptor bdesc;
+        Com_Memset( &bdesc, 0, sizeof( bdesc ) );
+        bdesc.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+        bdesc.size  = (uint64_t)WGPU_MAX_DYN_VERTS3D * sizeof( wgpuVert3D_t );
+        bdesc.label = "3D dynamic vertex buffer";
+        wgpu.dynVB3D = wgpuDeviceCreateBuffer( wgpu.device, &bdesc );
+    }
+
+    /* ---- 3D per-frame dynamic index buffer ---------------------------- */
+    {
+        WGPUBufferDescriptor bdesc;
+        Com_Memset( &bdesc, 0, sizeof( bdesc ) );
+        bdesc.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
+        bdesc.size  = (uint64_t)WGPU_MAX_DYN_INDEXES3D * sizeof( int );
+        bdesc.label = "3D dynamic index buffer";
+        wgpu.dynIB3D = wgpuDeviceCreateBuffer( wgpu.device, &bdesc );
+    }
+
+    /* ---- 3D uniform buffer ------------------------------------------- */
+    {
+        WGPUBufferDescriptor bdesc;
+        Com_Memset( &bdesc, 0, sizeof( bdesc ) );
+        bdesc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+        bdesc.size  = (uint64_t)WGPU_MAX_DRAWS3D * WGPU_3D_UB_STRIDE;
+        bdesc.label = "3D uniform buffer";
+        wgpu.ub3D = wgpuDeviceCreateBuffer( wgpu.device, &bdesc );
+    }
+
+    /* ---- CPU-side staging for 3D ---------------------------------------- */
+    wgpu.dynVerts3D = (wgpuVert3D_t *)ri.Malloc(
+        WGPU_MAX_DYN_VERTS3D * sizeof( wgpuVert3D_t ) );
+    wgpu.dynIndexes3D = (int *)ri.Malloc(
+        WGPU_MAX_DYN_INDEXES3D * sizeof( int ) );
+    wgpu.ub3DData = (byte *)ri.Malloc(
+        WGPU_MAX_DRAWS3D * WGPU_3D_UB_STRIDE );
+
+    if ( !wgpu.dynVerts3D || !wgpu.dynIndexes3D || !wgpu.ub3DData )
+        ri.Error( ERR_FATAL, "GLimp_Init: failed to allocate 3D staging buffers" );
+
     /* ---- WGSL shader modules + pipelines ------------------------------ */
     WR_InitShaderModules();
     WR_InitPipelines();
@@ -356,14 +417,19 @@ static void RE_GetGlConfig( glconfig_t *config )
 
 static qhandle_t RE_RegisterModel( const char *name )
 {
-    (void)name;
-    return 0;
+    int idx;
+    if ( !wgpu.initialized || !name || !name[0] ) return 0;
+    idx = WR_LoadModel( name );
+    return ( idx >= 0 ) ? (qhandle_t)( idx + 1 ) : 0;  /* +1 so handle 0 = invalid */
 }
 
 static void R_GetModelName( qhandle_t index, char *name, int sz )
 {
-    (void)index;
-    if ( sz > 0 ) name[0] = '\0';
+    int modelIdx = (int)index - 1;  /* handle 0 = invalid; model 0 has handle 1 */
+    if ( modelIdx >= 0 && modelIdx < wgpu.numModels && wgpu.models[modelIdx].loaded )
+        Q_strncpyz( name, wgpu.models[modelIdx].name, sz );
+    else if ( sz > 0 )
+        name[0] = '\0';
 }
 
 static qhandle_t RE_RegisterSkin( const char *name )
@@ -391,7 +457,11 @@ static qhandle_t RE_RegisterShaderLightMap( const char *name, int lightmap )
     return (qhandle_t)WR_RegisterShader( name, 0 );
 }
 
-static void RE_LoadWorldMap( const char *name )       { (void)name; }
+static void RE_LoadWorldMap( const char *name )
+{
+    if ( wgpu.initialized )
+        WR_LoadWorld( name );
+}
 static void RE_SetWorldVisData( const byte *vis )     { (void)vis;  }
 static void RE_EndRegistration( void )                {}
 
@@ -435,9 +505,40 @@ static void R_ModelBounds( qhandle_t model, vec3_t mins, vec3_t maxs )
     VectorClear( maxs );
 }
 
-static void RE_ClearScene( void )                              {}
-static void RE_AddRefEntityToScene( const refEntity_t *re )   { (void)re; }
-static void RE_AddRefEntityPtrToScene( refEntity_t *re )       { (void)re; }
+static void RE_ClearScene( void )
+{
+    wgpu.numEntities3D = 0;
+    wgpu.numPolys3D    = 0;
+}
+
+static void RE_AddRefEntityToScene( const refEntity_t *re )
+{
+    wgpuEntity3D_t *e;
+
+    if ( !wgpu.initialized || !re ) return;
+    if ( re->reType != RT_MODEL ) return;
+    if ( wgpu.numEntities3D >= WGPU_MAX_ENTITIES3D ) return;
+
+    e = &wgpu.entities3D[wgpu.numEntities3D++];
+    /* modelIndex: handle - 1 (handle 0 = invalid → modelIndex -1) */
+    e->modelIndex = ( re->hModel > 0 ) ? (int)( re->hModel - 1 ) : -1;
+    e->frame      = re->frame;
+    e->oldframe   = re->oldframe;
+    e->backlerp   = re->backlerp;
+    VectorCopy( re->origin, e->origin );
+    VectorCopy( re->axis[0], e->axis[0] );
+    VectorCopy( re->axis[1], e->axis[1] );
+    VectorCopy( re->axis[2], e->axis[2] );
+    e->color[0] = re->shaderRGBA[0] / 255.0f;
+    e->color[1] = re->shaderRGBA[1] / 255.0f;
+    e->color[2] = re->shaderRGBA[2] / 255.0f;
+    e->color[3] = re->shaderRGBA[3] / 255.0f;
+    /* Ensure at least some colour */
+    if ( e->color[0] == 0 && e->color[1] == 0 && e->color[2] == 0 && e->color[3] == 0 )
+        e->color[0] = e->color[1] = e->color[2] = e->color[3] = 1.0f;
+}
+
+static void RE_AddRefEntityPtrToScene( refEntity_t *re ) { RE_AddRefEntityToScene( re ); }
 static void RE_SetPathLines( int *numCameraPoints, cameraPoint_t *cameraPoints,
                               int *numSplinePoints, vec3_t *splinePoints,
                               const vec4_t color )
@@ -448,7 +549,21 @@ static void RE_SetPathLines( int *numCameraPoints, cameraPoint_t *cameraPoints,
 static void RE_AddPolyToScene( qhandle_t hShader, int numVerts,
                                 const polyVert_t *verts, int num, int lightmap )
 {
-    (void)hShader; (void)numVerts; (void)verts; (void)num; (void)lightmap;
+    int p, v;
+    (void)lightmap;
+
+    if ( !wgpu.initialized || !verts || numVerts < 3 ) return;
+
+    for ( p = 0; p < num && wgpu.numPolys3D < WGPU_MAX_POLYS3D; p++ )
+    {
+        wgpuPoly3D_t *poly = &wgpu.polys3D[wgpu.numPolys3D++];
+        int           nv   = numVerts > WGPU_MAX_POLY_VERTS ? WGPU_MAX_POLY_VERTS : numVerts;
+
+        poly->matIndex = (int)hShader;
+        poly->numVerts = nv;
+        for ( v = 0; v < nv; v++ )
+            poly->verts[v] = verts[p * numVerts + v];
+    }
 }
 static int R_LightForPoint( const vec3_t point, vec3_t ambientLight,
                               vec3_t directedLight, vec3_t lightDir )
@@ -469,7 +584,20 @@ static void RE_AddAdditiveLightToScene( const vec3_t org, float intensity,
 {
     (void)org; (void)intensity; (void)r; (void)g; (void)b;
 }
-static void RE_RenderScene( const refdef_t *fd )               { (void)fd; }
+static void RE_RenderScene( const refdef_t *fd )
+{
+    if ( !wgpu.initialized || !fd ) return;
+
+    /* Store viewport */
+    wgpu.view3Dx = fd->x;
+    wgpu.view3Dy = fd->y;
+    wgpu.view3Dw = fd->width;
+    wgpu.view3Dh = fd->height;
+
+    /* Build view-projection matrix for this frame */
+    WR_BuildViewProj( wgpu.viewProj, fd );
+    wgpu.haveRefdef = qtrue;
+}
 
 static void RE_SetColor( const float *rgba )
 {

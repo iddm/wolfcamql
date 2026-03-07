@@ -59,6 +59,21 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #define WGPU_UNIFORM_BUF_SIZE   256          /* padded to 256-byte alignment */
 #define MAX_PIPELINE_CACHE      16
 
+/* 3D limits */
+#define WGPU_MAX_WORLD_VERTS    800000
+#define WGPU_MAX_WORLD_INDEXES  1600000
+#define WGPU_MAX_WORLD_SURFS    65536
+#define WGPU_TESS_LEVEL         6            /* bezier patch tessellation level */
+#define WGPU_MAX_MODELS         512
+#define WGPU_MAX_MODEL_SURFS    64
+#define WGPU_MAX_DYN_VERTS3D    262144       /* per-frame dynamic 3D verts */
+#define WGPU_MAX_DYN_INDEXES3D  524288       /* per-frame dynamic 3D indexes */
+#define WGPU_MAX_DRAWS3D        8192         /* 3D draw calls per frame */
+#define WGPU_3D_UB_STRIDE       256          /* uniform buffer slot stride (alignment) */
+#define WGPU_MAX_ENTITIES3D     MAX_REFENTITIES
+#define WGPU_MAX_POLYS3D        4096
+#define WGPU_MAX_POLY_VERTS     64
+
 /* =========================================================================
  * WebGPU image slot
  *
@@ -113,6 +128,100 @@ typedef struct {
     float screenH;
     float _pad[2];
 } wgpuUniforms2D_t;
+
+/* =========================================================================
+ * 3D vertex layout (interleaved, 20 bytes)
+ *   offset  0: float x, y, z   (world position)
+ *   offset 12: float u, v       (texture coordinates)
+ * ========================================================================= */
+
+typedef struct {
+    float x, y, z;
+    float u, v;
+} wgpuVert3D_t;
+
+/* =========================================================================
+ * 3D uniform buffer (one per draw call, 80 bytes, stored at 256-byte stride)
+ * ========================================================================= */
+
+typedef struct {
+    float mvp[16];   /* 64 bytes: column-major MVP matrix */
+    float color[4];  /* 16 bytes: colour modulate */
+} wgpuUniforms3D_t;  /* 80 bytes total; each slot occupies 256 bytes in the GPU buffer */
+
+/* =========================================================================
+ * World (BSP) surface
+ * ========================================================================= */
+
+typedef struct {
+    int matIndex;
+    int firstIndex;   /* byte offset into worldIB */
+    int numIndexes;
+} wgpuWorldSurf_t;
+
+/* =========================================================================
+ * Model surface (one per MD3 surface)
+ * ========================================================================= */
+
+typedef struct {
+    int           matIndex;
+    int           numVerts;
+    int           numFrames;
+    int           numIndexes;
+    wgpuVert3D_t *frameVerts;  /* CPU array: numFrames * numVerts entries */
+    int          *indexes;     /* CPU array: numIndexes entries */
+} wgpuModelSurf_t;
+
+/* =========================================================================
+ * Model (MD3)
+ * ========================================================================= */
+
+typedef struct {
+    char           name[MAX_QPATH];
+    qboolean       loaded;
+    int            numSurfs;
+    int            numFrames;
+    wgpuModelSurf_t surfs[WGPU_MAX_MODEL_SURFS];
+} wgpuModel_t;
+
+/* =========================================================================
+ * Queued entity for 3D rendering
+ * ========================================================================= */
+
+typedef struct {
+    int   modelIndex;
+    int   frame;
+    int   oldframe;
+    float backlerp;
+    float origin[3];
+    float axis[3][3];
+    float color[4];
+} wgpuEntity3D_t;
+
+/* =========================================================================
+ * Queued poly for 3D rendering
+ * ========================================================================= */
+
+typedef struct {
+    int        matIndex;
+    int        numVerts;
+    polyVert_t verts[WGPU_MAX_POLY_VERTS];
+} wgpuPoly3D_t;
+
+/* =========================================================================
+ * 3D draw call
+ * ========================================================================= */
+
+typedef struct {
+    int         matIndex;
+    int         uniformSlot;   /* index into ub3DData array; offset = slot * WGPU_3D_UB_STRIDE */
+    WGPUBuffer  vb;
+    uint64_t    vbByteOffset;
+    WGPUBuffer  ib;
+    uint64_t    ibByteOffset;
+    int         numIndexes;
+    wgpuBlend_t blend;
+} wgpuDraw3D_t;
 
 /* =========================================================================
  * Blend modes for the pipeline cache
@@ -201,7 +310,49 @@ typedef struct {
     WGPUCommandEncoder encoder;
     qboolean           inFrame;
 
-    qboolean           initialized;
+    /* ---- 3D pipelines ----------------------------------------------- */
+    wgpuPipeline_t   pipe3D[WGPU_BLEND_COUNT];
+
+    /* ---- World (BSP) static geometry -------------------------------- */
+    WGPUBuffer       worldVB;
+    WGPUBuffer       worldIB;
+    wgpuWorldSurf_t *worldSurfs;
+    int              numWorldSurfs;
+    qboolean         worldLoaded;
+
+    /* ---- Models (MD3) ----------------------------------------------- */
+    wgpuModel_t      models[WGPU_MAX_MODELS];
+    int              numModels;
+
+    /* ---- Per-frame dynamic 3D geometry ------------------------------ */
+    WGPUBuffer       dynVB3D;
+    WGPUBuffer       dynIB3D;
+    wgpuVert3D_t    *dynVerts3D;
+    int             *dynIndexes3D;
+    int              numDynVerts3D;
+    int              numDynIndexes3D;
+
+    /* ---- Per-frame 3D uniform buffer -------------------------------- */
+    WGPUBuffer       ub3D;           /* MAX_DRAWS3D * WGPU_3D_UB_STRIDE bytes */
+    byte            *ub3DData;       /* CPU staging */
+    int              numUB3DSlots;   /* uniform slots used this frame */
+
+    /* ---- Per-frame 3D draw list ------------------------------------- */
+    wgpuDraw3D_t     draws3D[WGPU_MAX_DRAWS3D];
+    int              numDraws3D;
+
+    /* ---- Per-frame queued entities + polys -------------------------- */
+    wgpuEntity3D_t   entities3D[WGPU_MAX_ENTITIES3D];
+    int              numEntities3D;
+    wgpuPoly3D_t     polys3D[WGPU_MAX_POLYS3D];
+    int              numPolys3D;
+
+    /* ---- Current view (set by RE_RenderScene) ----------------------- */
+    qboolean         haveRefdef;
+    float            viewProj[16];   /* column-major VP matrix for world */
+    int              view3Dx, view3Dy, view3Dw, view3Dh;
+
+    qboolean         initialized;
 } wgpuGlobals_t;
 
 /* =========================================================================
@@ -237,8 +388,14 @@ int  WR_RegisterShaderFromData( const char *name, const byte *rgba,
 void            WR_InitShaderModules( void );
 void            WR_InitPipelines( void );
 wgpuPipeline_t *WR_GetPipeline2D( wgpuBlend_t blend );
+wgpuPipeline_t *WR_GetPipeline3D( wgpuBlend_t blend );
 WGPUBindGroup   WR_MakeBindGroup2D( const wgpuPipeline_t *pipe,
                                      WGPUBuffer ub,
+                                     WGPUTextureView tv,
+                                     WGPUSampler samp );
+WGPUBindGroup   WR_MakeBindGroup3D( const wgpuPipeline_t *pipe,
+                                     WGPUBuffer ub,
+                                     uint64_t ubOffset,
                                      WGPUTextureView tv,
                                      WGPUSampler samp );
 
@@ -248,6 +405,26 @@ void WR_EndFrame( void );
 void WR_AddStretchPic( float x, float y, float w, float h,
                         float s1, float t1, float s2, float t2,
                         int matIndex );
+int  WR_Alloc3DUniformSlot( const float mvp[16], const float color[4] );
+void WR_AddDraw3D( int matIndex, int uniformSlot,
+                   WGPUBuffer vb, uint64_t vbOff,
+                   WGPUBuffer ib, uint64_t ibOff,
+                   int numIndexes, wgpuBlend_t blend );
+void WR_BuildViewProj( float out[16], const refdef_t *fd );
+void WR_BuildModelMvp( float out[16], const float vp[16],
+                        const float origin[3], const float axis[3][3] );
+void WR_MatMul( float out[16], const float a[16], const float b[16] );
+
+/* tr_world.c */
+void WR_LoadWorld( const char *name );
+void WR_ClearWorld( void );
+void WR_AddWorldToFrame( void );
+
+/* tr_model.c */
+int  WR_LoadModel( const char *name );   /* returns modelIndex or -1 */
+void WR_FreeModels( void );
+void WR_AddEntityToFrame( const wgpuEntity3D_t *ent );
+void WR_AddPolysToFrame( void );
 
 /* tr_init.c (platform / window) */
 void GLimp_Init( qboolean fixedFunction );
